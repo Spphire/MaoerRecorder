@@ -5,3 +5,13 @@ __pycache__/
 venv/
 recordings/
 .env
+
+# 浏览器持久化 profile（含 cookie/session，早期版本遗留，勿提交）
+.profile/
+
+# 运行时产物
+record.log
+record.pid
+supervisor.log
+probe.log
+_*.txt
