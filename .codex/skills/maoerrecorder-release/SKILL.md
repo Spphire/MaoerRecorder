@@ -7,6 +7,8 @@ description: Build, validate, package, and optionally publish the MaoerRecorder 
 
 Use `scripts/package_release.ps1` from the repository root. It runs checks, builds the Windows onedir bundle in a temporary staging directory, runs the frozen self-test, audits package contents, creates a ZIP and SHA-256 file, and only mutates GitHub when `-Publish` is explicitly supplied.
 
+Run the examples with `pwsh` when PowerShell 7 is available. On Windows PowerShell 5, replace the command prefix with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File`; the script supports both hosts.
+
 ## Safety Rules
 
 - Never include `recordings`, `.dashboard`, `.env`, cookies, logs, profiles, or build caches in a release asset.

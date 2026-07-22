@@ -41,6 +41,26 @@ function Get-CommandOutput {
     return (($output | Out-String).Trim())
 }
 
+function Test-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$File,
+        [string[]]$Arguments = @()
+    )
+    # Windows PowerShell 5 promotes native stderr to an ErrorRecord when
+    # ErrorActionPreference is Stop. Commands such as `gh release view` use a
+    # non-zero exit plus stderr for an ordinary "not found" result, so probe
+    # them with a temporary non-terminating preference.
+    $OldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        & $File @Arguments *> $null
+        $ExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $OldPreference
+    }
+    return $ExitCode -eq 0
+}
+
 function Restore-EnvironmentValue {
     param([string]$Name, [AllowNull()][string]$Value, [bool]$WasDefined)
     if ($WasDefined) {
@@ -330,8 +350,9 @@ try {
             ) | Set-Content -LiteralPath $ResolvedNotes -Encoding utf8
         }
 
-        & gh release view $Tag --repo $Repo --json tagName *> $null
-        $ReleaseExists = $LASTEXITCODE -eq 0
+        $ReleaseExists = Test-NativeCommand "gh" @(
+            "release", "view", $Tag, "--repo", $Repo, "--json", "tagName"
+        )
         if ($ReleaseExists) {
             Invoke-Native "upload release assets" "gh" @(
                 "release", "upload", $Tag, $ArchivePath, $ChecksumPath,
