@@ -1,0 +1,4 @@
+interface:
+  display_name: "MaoerRecorder Release"
+  short_description: "Build, verify, and publish the Windows package"
+  default_prompt: "Use $maoerrecorder-release to build and publish a verified MaoerRecorder Windows release."

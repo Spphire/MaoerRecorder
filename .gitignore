@@ -24,3 +24,4 @@ dist/
 # Release artifacts (uploaded separately to GitHub Releases)
 *.zip
 *.zip.sha256
+release-artifacts/
