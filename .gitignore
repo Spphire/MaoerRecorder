@@ -15,3 +15,12 @@ record.pid
 supervisor.log
 probe.log
 _*.txt
+
+# Windows build output
+.build-venv/
+build/
+dist/
+
+# Release artifacts (uploaded separately to GitHub Releases)
+*.zip
+*.zip.sha256

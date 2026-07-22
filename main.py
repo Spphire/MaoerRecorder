@@ -42,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--room", type=int, default=None, help="直播间 ID")
+    common.add_argument("--managed-instance", default=None, help=argparse.SUPPRESS)
 
     p_rec = sub.add_parser("record", parents=[common], help="开始录制")
     p_rec.set_defaults(func=_cmd_record)

@@ -4,6 +4,24 @@
 
 ## 快速开始
 
+### Windows 控制面板（推荐）
+
+安装依赖后双击 `start_dashboard.bat`，或运行：
+
+```bash
+py dashboard.py
+```
+
+控制面板默认监听 `http://127.0.0.1:8765/`，并在 Windows 任务栏通知区域显示随系统深浅主题切换的猫耳图标。双击图标可重新打开面板；关闭网页不影响录制进程。每个房间使用独立进程、日志、状态和停止信号，可在面板中启动、停止、重启、强制结束、查看日志及打开录制目录。历史录制过的房间会自动出现在“常用房间”预设中，并显示主播名称、房间 ID 和场次数。
+
+构建便携版 EXE：
+
+```bat
+build_exe.bat
+```
+
+构建脚本会创建隔离环境，并打包无头 Chromium、ffmpeg 和 ffprobe。完成后双击 `dist\MaoerRecorder\MaoerRecorder.exe` 即可启动，无需另装 Python。在仓库内直接运行该 EXE 时会复用项目根目录已有的 `recordings` 并接管面板任务；将整个 `dist\MaoerRecorder` 文件夹复制到其他位置后，录制默认保存在 EXE 同级的 `recordings`。使用 `onedir` 是为了避免每个录制进程重复解压大型浏览器运行时。
+
 ### 安装
 
 ```bash
@@ -48,11 +66,13 @@ stop.bat            # Windows
 
 录制文件落在 `./recordings/<room>_<creator>/<timestamp>/`：
 
-- **`final.mp3`**：直播结束后自动合并去重转码出的整段（通用 MP3，**时间轴已对齐**）
-- **`chat.jsonl`**：弹幕流，按时间偏移 `t_audio` 对齐音频（秒数直接对应 MP3 播放位置）
+- **`final.m4a`**：直播结束后自动合并去重生成的整段，采用 M4A 容器、AAC-LC、48 kHz 双声道，**时间轴已对齐**。源片段参数一致且校验通过时优先按 AAC 帧直通；不满足直通条件时，回退为重建完整 PCM 时间线后只做一次 AAC 编码
+- **`chat.jsonl`**：弹幕流，按时间偏移 `t_audio` 对齐音频（秒数直接对应成品音频的播放位置）
 - `meta.json`：元数据（含时长、来源拆分、中断归因 `gaps`）
 - `audio_A_*.ts`, `audio_B_*.ts`：两路分段音频原始文件（A/B 热备）
 - `segments.jsonl`：每段在时间轴上的起点，供对齐重建用
+
+旧场次的 `final.mp3` 和 `final.ts` 仍可被控制面板及状态脚本识别。升级不会自动转换历史录音，原文件会保持不变，避免再做一次有损转码。
 
 ## 核心特性
 
@@ -70,7 +90,7 @@ stop.bat            # Windows
 
 **实测效果**（头部房间 47 万热度）：
 - 共用 cookie：两路几乎每秒卡，合并后大量 silence
-- **独立 cookie 池（当前方案）**：最终 `final.mp3` silence **<1%**
+- **独立 cookie 池（当前方案）**：最终成品音频 silence **<1%**
 
 **Cookie 烧毁自动轮换**：当某路连续空段（cookie 被平台临时封禁），自动从池中的 2 个备用身份换一个新鲜 cookie 继续录制，被烧毁的 cookie 充分冷却后重新进池。
 
@@ -78,14 +98,15 @@ stop.bat            # Windows
 
 ### 2. 时间轴对齐（音频 ↔ 弹幕）
 
-网络波动会导致音频丢失，但弹幕仍在记录。为保证对齐，`final.mp3` 在合并时会**在每个音频缺口处补入等长静音**：
+网络波动会导致音频丢失，但弹幕仍在记录。为保证对齐，`final.m4a` 在合并时会**在每个音频缺口处补入等长静音**：
 
 - 每段录制启动时记录其在会话时间轴上的起点 `t_start`（与弹幕 `t_audio` 同一时钟）
 - 合并时按 `t_start` 走时间轴，缺口（双路都没覆盖）> 0.5s 则插入等长静音
 - 会话结束若最后一段之后仍有时间（末段崩溃丢失），补尾部静音到会话结束时刻
 
-**结果**：`final.mp3` 的时间轴 == 墙钟时间轴 == 弹幕 `t_audio`。  
-任意一条弹幕的 `t_audio` 秒数，直接就是它在 `final.mp3` 里的播放位置。
+**结果**：`final.m4a` 的时间轴 == 墙钟时间轴 == 弹幕 `t_audio`。
+
+任意一条弹幕的 `t_audio` 秒数，直接就是它在 `final.m4a` 里的播放位置。
 
 ### 3. Supervisor 守护进程（推荐）
 
@@ -187,24 +208,27 @@ stop.bat            # Windows
 
 ### 两路频繁 restart、silence 很多
 
-**症状**：`record.log` 里每秒都有 `[A] restart` / `[B] restart`，最终 `final.mp3` silence 占比 >10%。  
+**症状**：`record.log` 里每秒都有 `[A] restart` / `[B] restart`，最终成品音频 silence 占比 >10%。
+
 **原因**：Cookie 被平台节流（共用 cookie 或池太小）。  
 **解决**：
 - 确认 `cookie pool: 5 independent guest identities ready`（默认配置）
 - 若仍频繁，增加备用数：`set MAOER_SPARE_COOKIES=3`
 
-### final.mp3 时长远小于实际直播时长
+### 成品音频时长远小于实际直播时长
 
-**症状**：主播播了 2 小时，`final.mp3` 只有 30 分钟。  
+**症状**：主播播了 2 小时，`final.m4a` 只有 30 分钟（旧场次可能是 `final.mp3`）。
+
 **原因**：录制中途崩溃，未触发 finalize；或 supervisor 重启后创建了新 session。  
 **排查**：
 - 查 `recordings/<room>_<creator>/` 下所有 `202*` 目录，每个是一场 session
-- 若有多个且都有 `final.mp3`，说明中途重启过（多段分开了），需手动拼接
-- 若某个目录只有 `.ts` 没有 `final.mp3`，说明该场未正常结束；段文件仍在，可用 ffmpeg 手动合并（见"工具脚本 → 手动合并"）
+- 若有多个且都有 `final.m4a`（或旧版的 `final.mp3`），说明中途重启过（多段分开了），需手动拼接
+- 若某个目录只有 `.ts` 没有 `final.m4a` / `final.mp3`，说明该场未正常结束；段文件仍在，可用 ffmpeg 手动合并（见"工具脚本 → 手动合并"）
 
 ### 弹幕与音频不对齐
 
-**症状**：弹幕 `t_audio=120` 的内容在 MP3 的 150 秒处出现。  
+**症状**：弹幕 `t_audio=120` 的内容在成品音频的 150 秒处出现。
+
 **原因**：`meta.json` 里 `timeline_aligned: false`（旧版录制或手动合并错误）。  
 **确认**：当前版本所有 session 的 `meta.json` 都应有 `"timeline_aligned": true`。若为 `false` 或缺失该字段，说明是旧版遗留。
 
@@ -225,7 +249,7 @@ python net_probe.py <cdn_host>
 ```bash
 cd recordings/<room>_<creator>/<timestamp>/
 for f in audio_A_*.ts; do echo "file '$f'"; done > concat.txt
-ffmpeg -f concat -safe 0 -i concat.txt -c:a libmp3lame -q:a 2 recovered.mp3
+ffmpeg -f concat -safe 0 -i concat.txt -map 0:a:0 -vn -c:a aac -profile:a aac_low -b:a 128k -ar 48000 -ac 2 -movflags +faststart recovered.m4a
 ```
 
 完整的双路去重 + 时间轴对齐合并由 `maoer/recorder.py` 的 `finalize()` 完成，它接受

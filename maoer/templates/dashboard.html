@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="maoer-token" content="{{ csrf_token }}">
+  <title>MaoerRecorder 控制台</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" aria-label="MaoerRecorder">
+      <span class="brand-mark" aria-hidden="true"><i data-lucide="audio-lines"></i></span>
+      <span class="brand-name">MaoerRecorder</span>
+    </div>
+    <div class="topbar-actions">
+      <span class="service-state"><span class="status-dot healthy"></span>服务在线</span>
+      <button class="icon-button" id="open-recordings" type="button" title="打开录制目录" aria-label="打开录制目录">
+        <i data-lucide="folder-open"></i>
+      </button>
+      <button class="icon-button" id="refresh-data" type="button" title="刷新" aria-label="刷新">
+        <i data-lucide="refresh-cw"></i>
+      </button>
+    </div>
+  </header>
+
+  <main class="app-shell">
+    <section class="command-bar" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">本地录制服务</p>
+        <h1 id="page-title">录制控制台</h1>
+      </div>
+      <form class="add-room-form" id="add-room-form" novalidate>
+        <label for="room-id">房间 ID</label>
+        <div class="input-action">
+          <input id="room-id" name="room_id" inputmode="numeric" autocomplete="off" maxlength="15" placeholder="输入直播间 ID" required>
+          <button class="primary-button" type="submit">
+            <i data-lucide="plus"></i><span>创建进程</span>
+          </button>
+        </div>
+        <p class="field-error" id="room-error" role="alert"></p>
+        <div class="preset-field" id="preset-field" hidden>
+          <label for="room-preset">常用房间</label>
+          <select id="room-preset">
+            <option value="">从历史录制中选择</option>
+          </select>
+          <span class="preset-description" id="preset-description"></span>
+        </div>
+      </form>
+    </section>
+
+    <section class="metrics" aria-label="录制概览">
+      <div class="metric"><span class="metric-label">进程总数</span><strong id="metric-processes">0</strong></div>
+      <div class="metric"><span class="metric-label">运行中</span><strong id="metric-active">0</strong></div>
+      <div class="metric"><span class="metric-label">正在录制</span><strong id="metric-recording">0</strong></div>
+      <div class="metric"><span class="metric-label">历史场次</span><strong id="metric-sessions">0</strong></div>
+      <div class="metric"><span class="metric-label">磁盘占用</span><strong id="metric-storage">0 B</strong><span class="metric-note" id="metric-disk-free"></span></div>
+    </section>
+
+    <nav class="view-tabs" aria-label="控制台视图">
+      <button class="tab-button active" type="button" data-view="processes" aria-selected="true">
+        <i data-lucide="list-checks"></i><span>进程</span><span class="tab-count" id="task-count">0</span>
+      </button>
+      <button class="tab-button" type="button" data-view="library" aria-selected="false">
+        <i data-lucide="archive"></i><span>录制库</span>
+      </button>
+    </nav>
+
+    <section class="view-panel active" id="processes-view" aria-labelledby="process-heading">
+      <div class="section-heading">
+        <div><h2 id="process-heading">录制进程</h2><p id="last-updated">正在读取状态</p></div>
+        <div class="filter-control" role="group" aria-label="筛选进程">
+          <button class="filter-button active" type="button" data-filter="all">全部</button>
+          <button class="filter-button" type="button" data-filter="active">运行中</button>
+          <button class="filter-button" type="button" data-filter="attention">需处理</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="process-table">
+          <thead><tr><th>房间</th><th>状态</th><th>进程</th><th>录制数据</th><th>启动时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+          <tbody id="process-rows"></tbody>
+        </table>
+        <div class="empty-state" id="process-empty" hidden>
+          <i data-lucide="radio"></i>
+          <p>还没有录制进程</p>
+          <button class="secondary-button" id="empty-add" type="button"><i data-lucide="plus"></i>添加房间</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="view-panel" id="library-view" aria-labelledby="library-heading" hidden>
+      <div class="section-heading">
+        <div><h2 id="library-heading">录制库</h2><p id="recordings-path"></p></div>
+      </div>
+      <div class="table-wrap">
+        <table class="library-table">
+          <thead><tr><th>房间</th><th>场次</th><th>已完成</th><th>总时长</th><th>占用空间</th><th>最后活动</th><th><span class="sr-only">操作</span></th></tr></thead>
+          <tbody id="library-rows"></tbody>
+        </table>
+        <div class="empty-state" id="library-empty" hidden><i data-lucide="archive"></i><p>还没有录制内容</p></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+  <aside class="log-drawer" id="log-drawer" aria-labelledby="log-title" aria-hidden="true">
+    <header class="drawer-header">
+      <div><p class="eyebrow">进程日志</p><h2 id="log-title">房间日志</h2></div>
+      <div class="drawer-actions">
+        <button class="icon-button" id="refresh-logs" type="button" title="刷新日志" aria-label="刷新日志"><i data-lucide="refresh-cw"></i></button>
+        <button class="icon-button" id="close-logs" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+      </div>
+    </header>
+    <div class="log-meta"><span id="log-status"></span><code id="log-path"></code></div>
+    <pre class="log-output" id="log-output">暂无日志</pre>
+  </aside>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+
+  <script src="{{ url_for('static', filename='lucide.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

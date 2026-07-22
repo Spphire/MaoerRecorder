@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,12 +62,26 @@ _FFMPEG_FALLBACKS = [
     Path("C:/ffmpeg/bin/ffmpeg.exe"),
 ]
 
+if getattr(sys, "frozen", False):
+    _FFMPEG_FALLBACKS.insert(
+        0,
+        Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        / "vendor/ffmpeg/ffmpeg.exe",
+    )
+
 
 def _resolve_ffmpeg() -> str:
-    """Return a usable ffmpeg path. Order: env, PATH, known install dirs."""
+    """Return a usable ffmpeg path, preferring the frozen bundle when present."""
     explicit = os.getenv("FFMPEG_PATH")
     if explicit and Path(explicit).exists():
         return explicit
+    if getattr(sys, "frozen", False):
+        bundled = (
+            Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+            / "vendor/ffmpeg/ffmpeg.exe"
+        )
+        if bundled.exists():
+            return str(bundled)
     found = shutil.which("ffmpeg")
     if found:
         return found

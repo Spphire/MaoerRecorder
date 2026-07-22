@@ -22,8 +22,10 @@ stay aligned — see finalize.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -56,6 +58,16 @@ FFMPEG_FATAL_PATTERNS = re.compile(
 
 # Gaps shorter than this are normal segment-boundary jitter, not real drops.
 _GAP_THRESHOLD_SECONDS = 0.5
+_OUTPUT_SAMPLE_RATE = 48000
+_OUTPUT_CHANNELS = 2
+_OUTPUT_BIT_RATE = "128k"
+_AAC_FRAME_SAMPLES = 1024
+_FINAL_OUTPUT_NAME = "final.m4a"
+
+
+def _capture_audio_args() -> list[str]:
+    """Keep the platform AAC bitstream and discard non-audio streams."""
+    return ["-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a", "copy"]
 
 
 def sanitize(name: str) -> str:
@@ -222,8 +234,7 @@ class FfmpegWorker:
                 "-rw_timeout", "30000000",
                 "-fflags", "+genpts+igndts+discardcorrupt",
                 "-i", creds.url,
-                "-c:a", "aac",
-                "-b:a", "128k",
+                *_capture_audio_args(),
                 "-flush_packets", "1",
                 "-f", "mpegts",
                 str(out_path),
@@ -567,54 +578,435 @@ def _probe_duration(ffprobe: str, path: Path) -> float:
         return 0.0
 
 
-def _make_silence(ffmpeg: str, out: Path, seconds: float) -> bool:
+def _probe_decoded_duration(ffmpeg: str, path: Path) -> float:
+    """Measure the audio timeline after normalizing its source timestamps."""
     try:
         proc = subprocess.run(
-            [ffmpeg, "-y", "-f", "lavfi",
-             "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-             "-t", f"{seconds:.3f}", "-c:a", "libmp3lame", "-q:a", "2", str(out)],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            [
+                ffmpeg, "-v", "error", "-xerror", "-i", str(path),
+                "-map", "0:a:0",
+                "-af", (
+                    "asetpts=PTS-STARTPTS,"
+                    f"aresample={_OUTPUT_SAMPLE_RATE}:async=1000:first_pts=0"
+                ),
+                "-progress", "pipe:1", "-nostats",
+                "-f", "null", "-",
+            ],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
-        return proc.returncode == 0 and out.exists() and out.stat().st_size > 0
+        output = (proc.stdout or b"").decode("utf-8", "replace")
+        values = [
+            int(line.partition("=")[2])
+            for line in output.splitlines()
+            if line.startswith("out_time_us=")
+            and line.partition("=")[2].strip().lstrip("-").isdigit()
+        ]
+        if values and proc.returncode == 0:
+            return max(values) / 1_000_000.0
     except Exception:
-        return False
+        pass
+    return 0.0
 
 
-def _slice_to_mp3(ffmpeg: str, src: Path, seek: float, take: float, out: Path) -> bool:
-    """Extract [seek, seek+take] of a segment's audio as MP3.
+def _probe_audio_runs(ffprobe: str, path: Path) -> list[tuple[float, float]]:
+    """Return continuous audio PTS ranges, relative to the first packet."""
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "packet=pts_time,duration_time",
+                "-of", "csv=p=0", str(path),
+            ],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0:
+            return []
+        first_pts: float | None = None
+        run_start = run_end = 0.0
+        runs: list[tuple[float, float]] = []
+        for raw_line in (proc.stdout or b"").decode("utf-8", "replace").splitlines():
+            fields = raw_line.split(",", 2)
+            if len(fields) < 2:
+                continue
+            try:
+                pts = float(fields[0])
+                duration = float(fields[1])
+            except ValueError:
+                continue
+            if first_pts is None:
+                first_pts = pts
+                run_start = 0.0
+            packet_start = max(0.0, pts - first_pts)
+            packet_end = packet_start + max(0.0, duration)
+            if packet_start - run_end > _GAP_THRESHOLD_SECONDS:
+                if run_end - run_start > 0.01:
+                    runs.append((run_start, run_end))
+                run_start = packet_start
+            run_end = max(run_end, packet_end)
+        if first_pts is not None and run_end - run_start > 0.01:
+            runs.append((run_start, run_end))
+        return runs
+    except Exception:
+        return []
 
-    Normalizing every piece to identical MP3 params is what makes the final
-    concat reliable — raw mpegts segments carry a stray mpeg2video stream and
-    48kHz AAC, which silently breaks the concat demuxer if mixed.
+
+@dataclass(frozen=True)
+class AdtsInfo:
+    frames: int
+    object_type: int
+    sample_rate: int
+    channels: int
+    mpeg_id: int
+
+    @property
+    def config(self) -> tuple[int, int, int, int]:
+        return self.object_type, self.sample_rate, self.channels, self.mpeg_id
+
+
+_ADTS_SAMPLE_RATES = (
+    96000, 88200, 64000, 48000, 44100, 32000, 24000,
+    22050, 16000, 12000, 11025, 8000, 7350,
+)
+
+
+def _scan_adts(path: Path) -> AdtsInfo | None:
+    """Validate every ADTS frame and return its uniform stream config."""
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return None
+        frames = 0
+        config: tuple[int, int, int, int] | None = None
+        with path.open("rb") as stream:
+            pos = 0
+            while pos < size:
+                stream.seek(pos)
+                header = stream.read(7)
+                if len(header) != 7 or header[0] != 0xFF or (header[1] & 0xF6) != 0xF0:
+                    return None
+                if header[6] & 0x03:
+                    return None
+                object_type = ((header[2] >> 6) & 0x03) + 1
+                sample_index = (header[2] >> 2) & 0x0F
+                if sample_index >= len(_ADTS_SAMPLE_RATES):
+                    return None
+                sample_rate = _ADTS_SAMPLE_RATES[sample_index]
+                channels = ((header[2] & 0x01) << 2) | ((header[3] >> 6) & 0x03)
+                mpeg_id = (header[1] >> 3) & 0x01
+                frame_length = (
+                    ((header[3] & 0x03) << 11)
+                    | (header[4] << 3)
+                    | ((header[5] >> 5) & 0x07)
+                )
+                header_length = 7 if header[1] & 0x01 else 9
+                if frame_length < header_length or pos + frame_length > size:
+                    return None
+                current = (object_type, sample_rate, channels, mpeg_id)
+                if config is None:
+                    config = current
+                elif current != config:
+                    return None
+                frames += 1
+                pos += frame_length
+        if not config or frames <= 0:
+            return None
+        return AdtsInfo(frames, *config)
+    except OSError:
+        return None
+
+
+def _probe_audio_spec(ffprobe: str, path: Path) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "a:0",
+                "-show_entries",
+                "stream=codec_name,profile,sample_rate,channels,bit_rate",
+                "-of", "json", str(path),
+            ],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        payload = json.loads((proc.stdout or b"{}").decode("utf-8", "replace"))
+        streams = payload.get("streams", [])
+        if proc.returncode != 0 or not streams:
+            return {}
+        info = dict(streams[0])
+        for key in ("sample_rate", "channels", "bit_rate"):
+            try:
+                info[key] = int(info[key])
+            except (KeyError, TypeError, ValueError):
+                info[key] = None
+        return info
+    except (OSError, TypeError, ValueError):
+        return {}
+
+
+def _aac_passthrough_compatible(ffprobe: str, paths: set[Path]) -> bool:
+    for path in paths:
+        info = _probe_audio_spec(ffprobe, path)
+        if (
+            info.get("codec_name") != "aac"
+            or info.get("profile") != "LC"
+            or info.get("sample_rate") != _OUTPUT_SAMPLE_RATE
+            or info.get("channels") != _OUTPUT_CHANNELS
+        ):
+            return False
+    return bool(paths)
+
+
+def _quantize_plan(plan: list[tuple]) -> tuple[list[tuple[tuple, int]], int]:
+    """Assign every plan item to one cumulative AAC frame grid.
+
+    Audio seeks move by the same rounding carry as their output boundary. This
+    keeps adjacent slices content-contiguous instead of skipping or repeating
+    a source frame whenever a non-frame-aligned boundary rounds up or down.
     """
-    args = [ffmpeg, "-y"]
-    if seek > 0.01:
-        args += ["-ss", f"{seek:.3f}"]
-    args += ["-i", str(src)]
-    if take > 0.01:
-        args += ["-t", f"{take:.3f}"]
-    args += ["-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-q:a", "2", str(out)]
+    frame_rate = _OUTPUT_SAMPLE_RATE / _AAC_FRAME_SAMPLES
+    cumulative = 0.0
+    previous_end = 0
+    quantized: list[tuple[tuple, int]] = []
+    for item in plan:
+        item_start = cumulative
+        duration = float(item[3] if item[0] == "audio" else item[1])
+        cumulative += max(0.0, duration)
+        frame_end = int(cumulative * frame_rate + 0.5)
+        frames = frame_end - previous_end
+        if frames > 0:
+            quantized_item = item
+            if item[0] == "audio":
+                _, path, seek, take = item
+                quantized_start = previous_end / frame_rate
+                adjusted_seek = max(0.0, float(seek) + quantized_start - item_start)
+                quantized_item = ("audio", path, adjusted_seek, take)
+            quantized.append((quantized_item, frames))
+        previous_end = frame_end
+    return quantized, previous_end
+
+
+def _extract_aac_copy(
+    ffmpeg: str, src: Path, seek: float, take: float, frames: int, out: Path,
+) -> AdtsInfo | None:
+    """Copy a frame-aligned AAC interval from an input segment to ADTS."""
+    frame_seconds = _AAC_FRAME_SAMPLES / _OUTPUT_SAMPLE_RATE
+    args = [ffmpeg, "-y", "-i", str(src)]
+    if seek > 0.000001:
+        args += ["-ss", f"{max(0.0, seek - 0.000001):.6f}"]
+    args += [
+        "-map", "0:a:0", "-vn", "-sn", "-dn",
+        "-t", f"{max(take, frames * frame_seconds) + frame_seconds:.6f}",
+        "-c:a", "copy", "-frames:a", str(frames), "-f", "adts", str(out),
+    ]
     try:
         proc = subprocess.run(
             args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        info = _scan_adts(out) if proc.returncode == 0 else None
+        return info if info and info.frames == frames else None
+    except OSError:
+        return None
+
+
+def _make_aac_silence(ffmpeg: str, out: Path, frames: int) -> AdtsInfo | None:
+    """Encode silence, then frame-trim away the native AAC encoder flush."""
+    encoded = out.with_name(f"{out.stem}.encoded.aac")
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-y", "-f", "lavfi", "-i",
+                f"anullsrc=channel_layout=stereo:sample_rate={_OUTPUT_SAMPLE_RATE}",
+                "-frames:a", str(frames), "-c:a", "aac", "-profile:a", "aac_low",
+                "-b:a", _OUTPUT_BIT_RATE, "-ar", str(_OUTPUT_SAMPLE_RATE),
+                "-ac", str(_OUTPUT_CHANNELS), "-f", "adts", str(encoded),
+            ],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0:
+            return None
+        proc = subprocess.run(
+            [
+                ffmpeg, "-y", "-i", str(encoded), "-map", "0:a:0",
+                "-c:a", "copy", "-frames:a", str(frames), "-f", "adts", str(out),
+            ],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        info = _scan_adts(out) if proc.returncode == 0 else None
+        return info if info and info.frames == frames else None
+    except OSError:
+        return None
+    finally:
+        try:
+            encoded.unlink()
+        except OSError:
+            pass
+
+
+def _join_adts(parts: list[Path], joined: Path) -> AdtsInfo | None:
+    try:
+        with joined.open("wb") as target:
+            for part in parts:
+                with part.open("rb") as source:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+        return _scan_adts(joined)
+    except OSError:
+        return None
+
+
+def _mux_adts_to_m4a(ffmpeg: str, joined: Path, out: Path) -> bool:
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-y", "-f", "aac", "-i", str(joined),
+                "-map", "0:a:0", "-c:a", "copy", "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+faststart", "-f", "ipod", str(out),
+            ],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+            log.warning("M4A remux failed: %s", tail)
         return proc.returncode == 0 and out.exists() and out.stat().st_size > 0
-    except Exception:
+    except OSError:
         return False
 
 
-def _collect_lane(ffprobe: str, session_dir: Path, segments: dict) -> list[dict]:
-    """Return sorted [{path, t_start, t_end, dur}] of real (non-empty) segments."""
+def _probe_packet_durations(ffprobe: str, path: Path) -> list[int]:
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "packet=duration", "-of", "csv=p=0", str(path),
+            ],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0:
+            return []
+        return [
+            int(line.split(",", 1)[0])
+            for line in (proc.stdout or b"").decode("utf-8", "replace").splitlines()
+            if line.split(",", 1)[0].strip().isdigit()
+        ]
+    except (OSError, ValueError):
+        return []
+
+
+def _validate_m4a(
+    ffmpeg: str, ffprobe: str, path: Path, expected_frames: int,
+    *, exact_packets: bool,
+) -> tuple[dict[str, Any], float] | None:
+    info = _probe_audio_spec(ffprobe, path)
+    if (
+        info.get("codec_name") != "aac"
+        or info.get("profile") != "LC"
+        or info.get("sample_rate") != _OUTPUT_SAMPLE_RATE
+        or info.get("channels") != _OUTPUT_CHANNELS
+    ):
+        return None
+    packet_durations = _probe_packet_durations(ffprobe, path)
+    if not packet_durations or any(value != _AAC_FRAME_SAMPLES for value in packet_durations):
+        return None
+    if exact_packets and len(packet_durations) != expected_frames:
+        return None
+    duration = _probe_decoded_duration(ffmpeg, path)
+    expected_duration = expected_frames * _AAC_FRAME_SAMPLES / _OUTPUT_SAMPLE_RATE
+    tolerance = (_AAC_FRAME_SAMPLES / _OUTPUT_SAMPLE_RATE) * (1 if exact_packets else 3)
+    if duration <= 0 or abs(duration - expected_duration) > tolerance:
+        return None
+    return info, duration
+
+
+def _write_zeros(stream: Any, size: int) -> None:
+    block = b"\0" * (1024 * 1024)
+    remaining = size
+    while remaining > 0:
+        chunk = block if remaining >= len(block) else block[:remaining]
+        stream.write(chunk)
+        remaining -= len(chunk)
+
+
+def _render_pcm_timeline(
+    ffmpeg: str, quantized: list[tuple[tuple, int]], out: Path,
+) -> bool:
+    bytes_per_sample = _OUTPUT_CHANNELS * 2
+    try:
+        with out.open("wb", buffering=0) as target:
+            for item, frames in quantized:
+                samples = frames * _AAC_FRAME_SAMPLES
+                expected_bytes = samples * bytes_per_sample
+                if item[0] == "silence":
+                    _write_zeros(target, expected_bytes)
+                    continue
+                _, src, seek, _take = item
+                start = target.tell()
+                args = [ffmpeg, "-v", "error"]
+                if seek > 0.01:
+                    args += ["-ss", f"{seek:.6f}"]
+                args += [
+                    "-i", str(src), "-map", "0:a:0", "-vn", "-sn", "-dn",
+                    "-af", (
+                        "asetpts=PTS-STARTPTS,"
+                        f"aresample={_OUTPUT_SAMPLE_RATE}:async=1000:first_pts=0,"
+                        f"atrim=end_sample={samples},asetpts=N/SR/TB"
+                    ),
+                    "-ar", str(_OUTPUT_SAMPLE_RATE), "-ac", str(_OUTPUT_CHANNELS),
+                    "-c:a", "pcm_s16le", "-f", "s16le", "-",
+                ]
+                proc = subprocess.run(
+                    args, check=False, stdout=target, stderr=subprocess.DEVNULL)
+                if proc.returncode != 0:
+                    return False
+                actual = target.tell() - start
+                if actual > expected_bytes:
+                    target.truncate(start + expected_bytes)
+                    target.seek(0, os.SEEK_END)
+                elif actual < expected_bytes:
+                    _write_zeros(target, expected_bytes - actual)
+        return out.exists() and out.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _encode_pcm_m4a(ffmpeg: str, pcm: Path, out: Path) -> bool:
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-y", "-f", "s16le", "-ar", str(_OUTPUT_SAMPLE_RATE),
+                "-ac", str(_OUTPUT_CHANNELS), "-i", str(pcm),
+                "-c:a", "aac", "-profile:a", "aac_low", "-b:a", _OUTPUT_BIT_RATE,
+                "-movflags", "+faststart", "-f", "ipod", str(out),
+            ],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+            log.warning("AAC fallback encode failed: %s", tail)
+        return proc.returncode == 0 and out.exists() and out.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _collect_lane(
+    ffmpeg: str, ffprobe: str, session_dir: Path, segments: dict,
+) -> list[dict]:
+    """Return continuous audio ranges from all real, non-empty segments."""
     out = []
     for idx in sorted(segments):
         meta = segments[idx]
         p = session_dir / meta["file"]
         if not (p.exists() and p.stat().st_size > 0):
             continue
-        dur = _probe_duration(ffprobe, p)
-        if dur <= 0:
-            continue
         t0 = float(meta.get("t_start", 0.0))
-        out.append({"path": p, "t_start": t0, "t_end": t0 + dur, "dur": dur})
+        runs = _probe_audio_runs(ffprobe, p)
+        if not runs:
+            dur = _probe_decoded_duration(ffmpeg, p) or _probe_duration(ffprobe, p)
+            runs = [(0.0, dur)] if dur > 0 else []
+        for source_start, source_end in runs:
+            dur = source_end - source_start
+            out.append({
+                "path": p,
+                "t_start": t0 + source_start,
+                "t_end": t0 + source_end,
+                "dur": dur,
+                "source_start": source_start,
+            })
     out.sort(key=lambda s: s["t_start"])
     return out
 
@@ -643,7 +1035,8 @@ def finalize(session: RecordSession) -> None:
     # Collect each lane. Worker A is primary; any others are backups.
     lanes: dict[str, list[dict]] = {}
     for w in session.workers:
-        lanes[w.label] = _collect_lane(ffprobe, session.session_dir, w.segments)
+        lanes[w.label] = _collect_lane(
+            ffmpeg, ffprobe, session.session_dir, w.segments)
     primary = lanes.get("A", [])
     backups: list[list[dict]] = [lanes[k] for k in lanes if k != "A"]
     backup = backups[0] if backups else []
@@ -654,7 +1047,11 @@ def finalize(session: RecordSession) -> None:
 
     # Determine end of timeline.
     all_ends = [s["t_end"] for lane in lanes.values() for s in lane]
-    end = session.end_offset or (max(all_ends) if all_ends else 0.0)
+    end = (
+        session.end_offset
+        if session.end_offset is not None
+        else (max(all_ends) if all_ends else 0.0)
+    )
 
     # Greedy timeline walk: A preferred, B fills A's gaps, else silence.
     plan: list[tuple] = []  # ('audio', path, seek, take) | ('silence', dur)
@@ -662,23 +1059,25 @@ def finalize(session: RecordSession) -> None:
     cov_a = cov_b = cov_sil = 0.0
     timeline = 0.0
     guard = 0
-    while timeline < end - _GAP_THRESHOLD_SECONDS and guard < 100000:
+    while timeline < end - 0.000001 and guard < 100000:
         guard += 1
         a = _covering(primary, timeline)
         if a:
-            seek = timeline - a["t_start"]
-            take = a["t_end"] - timeline
+            seek = a.get("source_start", 0.0) + timeline - a["t_start"]
+            stop_at = min(a["t_end"], end)
+            take = stop_at - timeline
             plan.append(("audio", a["path"], seek, take))
             cov_a += take
-            timeline = a["t_end"]
+            timeline = stop_at
             continue
         b = _covering(backup, timeline)
         if b:
             na = _next_start_after(primary, timeline)
-            stop_at = min(b["t_end"], na) if na is not None else b["t_end"]
+            stop_at = min(b["t_end"], end, na if na is not None else end)
             take = stop_at - timeline
             if take > 0.01:
-                plan.append(("audio", b["path"], timeline - b["t_start"], take))
+                seek = b.get("source_start", 0.0) + timeline - b["t_start"]
+                plan.append(("audio", b["path"], seek, take))
                 cov_b += take
                 timeline = stop_at
                 continue
@@ -690,7 +1089,10 @@ def finalize(session: RecordSession) -> None:
         gap = nxt - timeline
         if gap > _GAP_THRESHOLD_SECONDS:
             plan.append(("silence", gap))
-            gaps.append({"at": round(timeline, 1), "dur": round(gap, 1)})
+            gap_meta = {"at": round(timeline, 1), "dur": round(gap, 1)}
+            if nxt >= end - _GAP_THRESHOLD_SECONDS:
+                gap_meta["trailing"] = True
+            gaps.append(gap_meta)
             cov_sil += gap
         timeline = nxt
 
@@ -701,63 +1103,127 @@ def finalize(session: RecordSession) -> None:
                      "trailing": True})
         cov_sil += end - timeline
 
-    # Render each plan item to a uniform MP3 part, then concat-copy.
+    quantized, total_frames = _quantize_plan(plan)
     parts_dir = session.session_dir / "_parts"
     parts_dir.mkdir(exist_ok=True)
-    concat = session.session_dir / "concat.txt"
-    lines: list[str] = []
-    for i, item in enumerate(plan):
-        out = parts_dir / f"p_{i:05d}.mp3"
-        if item[0] == "audio":
-            _, path, seek, take = item
-            if take <= 0.01:
-                continue
-            if _slice_to_mp3(ffmpeg, path, seek, take, out):
-                lines.append(f"file '{out.relative_to(session.session_dir).as_posix()}'")
-            else:
-                log.warning("slice failed: %s [%.1f+%.1f]", path.name, seek, take)
-        else:
-            _, dur = item
-            if _make_silence(ffmpeg, out, dur):
-                lines.append(f"file '{out.relative_to(session.session_dir).as_posix()}'")
-
-    if not lines:
-        log.warning("no parts rendered; aborting merge")
-        return
-    concat.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    final = session.session_dir / "final.mp3"
-    ok = False
-    try:
-        proc = subprocess.run(
-            [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat),
-             "-c", "copy", str(final)],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
-        ok = proc.returncode == 0 and final.exists() and final.stat().st_size > 0
-        if not ok:
-            tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
-            log.warning("mp3 concat rc=%s: %s", proc.returncode, tail)
-    except Exception as exc:
-        log.warning("mp3 concat failed: %s", exc)
-
-    if ok and parts_dir.exists():
-        for f in parts_dir.glob("*.mp3"):
+    for stale in parts_dir.iterdir():
+        if stale.is_file():
             try:
-                f.unlink()
+                stale.unlink()
             except OSError:
                 pass
+
+    final = session.session_dir / _FINAL_OUTPUT_NAME
+    partial = session.session_dir / "final.partial.m4a"
+    joined = parts_dir / "joined.aac"
+    pcm = parts_dir / "timeline.s16le"
+    ok = False
+    processing_mode = "passthrough"
+    fallback_reason: str | None = None
+    media_info: dict[str, Any] = {}
+    final_dur = 0.0
+
+    source_paths = {
+        item[1] for item, _frames in quantized if item[0] == "audio"
+    }
+    if not _aac_passthrough_compatible(ffprobe, source_paths):
+        fallback_reason = "source audio is not AAC-LC 48 kHz stereo"
+    else:
+        parts: list[Path] = []
+        expected_config: tuple[int, int, int, int] | None = None
+        for index, (item, frames) in enumerate(quantized):
+            out = parts_dir / f"p_{index:05d}.aac"
+            if item[0] == "audio":
+                _, path, seek, take = item
+                adts = _extract_aac_copy(ffmpeg, path, seek, take, frames, out)
+            else:
+                adts = _make_aac_silence(ffmpeg, out, frames)
+            if (
+                not adts
+                or adts.object_type != 2
+                or adts.sample_rate != _OUTPUT_SAMPLE_RATE
+                or adts.channels != _OUTPUT_CHANNELS
+            ):
+                fallback_reason = f"AAC part {index} failed frame validation"
+                break
+            if expected_config is None:
+                expected_config = adts.config
+            elif adts.config != expected_config:
+                fallback_reason = f"AAC part {index} has incompatible stream config"
+                break
+            parts.append(out)
+
+        if len(parts) == len(quantized):
+            joined_info = _join_adts(parts, joined)
+            if (
+                not joined_info
+                or joined_info.frames != total_frames
+                or joined_info.config != expected_config
+            ):
+                fallback_reason = "joined AAC stream failed frame validation"
+            else:
+                try:
+                    partial.unlink()
+                except OSError:
+                    pass
+                if _mux_adts_to_m4a(ffmpeg, joined, partial):
+                    validated = _validate_m4a(
+                        ffmpeg, ffprobe, partial, total_frames, exact_packets=True)
+                    if validated:
+                        media_info, final_dur = validated
+                        ok = True
+                    else:
+                        fallback_reason = "M4A passthrough output failed validation"
+                else:
+                    fallback_reason = "M4A passthrough mux failed"
+
+    if not ok:
+        processing_mode = "transcoded"
+        log.warning("AAC passthrough unavailable; using one-pass fallback: %s",
+                    fallback_reason or "unknown reason")
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+        if _render_pcm_timeline(ffmpeg, quantized, pcm) and _encode_pcm_m4a(
+            ffmpeg, pcm, partial
+        ):
+            validated = _validate_m4a(
+                ffmpeg, ffprobe, partial, total_frames, exact_packets=False)
+            if validated:
+                media_info, final_dur = validated
+                ok = True
+
+    if ok:
+        try:
+            os.replace(partial, final)
+        except OSError as exc:
+            log.warning("publishing final M4A failed: %s", exc)
+            ok = False
+
+    for temp in (partial, joined, pcm):
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+    if parts_dir.exists():
+        for temp in parts_dir.iterdir():
+            if temp.is_file():
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
         try:
             parts_dir.rmdir()
         except OSError:
             pass
 
-    final_dur = _probe_duration(ffprobe, final) if ok else 0.0
     wall = round(time.monotonic() - session.start_mono, 2)
+    duration = round(session.end_offset if session.end_offset is not None else wall, 2)
     meta = {
         "room_id": session.room_id,
         "start_time": session.start_wall,
-        "duration": wall,
+        "duration": duration,
         "audio_duration": round(final_dur, 2),
         "dual_record": len(session.workers) > 1,
         "source_breakdown": {
@@ -766,17 +1232,26 @@ def finalize(session: RecordSession) -> None:
             "silence": round(cov_sil, 1),
         },
         # Every both-lanes-down stretch (where silence was inserted), with its
-        # offset into final.mp3. Cross-check each against record.log's per-lane
+        # offset into the final audio. Cross-check each against record.log's per-lane
         # restart timestamps to confirm both lanes were truly down.
         "gaps": gaps,
-        "output": "final.mp3" if ok else "(failed)",
-        "timeline_aligned": True,
+        "output": _FINAL_OUTPUT_NAME if ok else "(failed)",
+        "timeline_aligned": ok,
+        "audio_codec": media_info.get("codec_name") if ok else None,
+        "audio_profile": media_info.get("profile") if ok else None,
+        "audio_sample_rate": media_info.get("sample_rate") if ok else None,
+        "audio_channels": media_info.get("channels") if ok else None,
+        "audio_bit_rate": media_info.get("bit_rate") if ok else None,
+        "uniform_sample_rate": bool(ok),
+        "processing_mode": processing_mode if ok else "failed",
+        "source_audio_passthrough": bool(ok and processing_mode == "passthrough"),
+        "fallback_reason": fallback_reason if processing_mode == "transcoded" else None,
     }
     (session.session_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     log.info(
         "final: %s | dur=%.0fs (A=%.0fs B=%.0fs sil=%.0fs)",
-        "final.mp3" if ok else "FAILED",
+        _FINAL_OUTPUT_NAME if ok else "FAILED",
         final_dur, cov_a, cov_b, cov_sil,
     )

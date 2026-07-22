@@ -86,7 +86,9 @@ else:
 
 # 4. final output presence
 finals = sorted(
-    list(rec.glob('*/*/final.mp3')) + list(rec.glob('*/*/final.ts')),
+    list(rec.glob('*/*/final.m4a'))
+    + list(rec.glob('*/*/final.mp3'))
+    + list(rec.glob('*/*/final.ts')),
     key=lambda f: f.stat().st_mtime, reverse=True,
 )
 if finals:
