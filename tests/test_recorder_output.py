@@ -164,10 +164,11 @@ def _long_source_run(source: Path) -> list[dict]:
 def test_capture_worker_uses_audio_stream_copy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    captured: dict[str, list[str]] = {}
+    captured: dict[str, object] = {}
 
     def fake_popen(command: list[str], **_kwargs: object) -> SimpleNamespace:
         captured["command"] = command
+        captured["kwargs"] = _kwargs
         return SimpleNamespace(stderr=None)
 
     class NoopThread:
@@ -199,12 +200,36 @@ def test_capture_worker_uses_audio_stream_copy(
     worker._launch_segment()
 
     command = captured["command"]
+    assert isinstance(command, list)
     assert command[command.index("-map") + 1] == "0:a:0"
     assert command[command.index("-c:a") + 1] == "copy"
     assert "-vn" in command
     assert "-sn" in command
     assert "-dn" in command
     assert "-b:a" not in command
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["creationflags"] == recorder._NO_WINDOW_CREATIONFLAGS
+
+
+def test_media_helpers_run_without_windows_console(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout=b"1.0\n")
+
+    monkeypatch.setattr(recorder.subprocess, "run", fake_run)
+
+    assert recorder._probe_duration("ffprobe", tmp_path / "source.ts") == 1.0
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["creationflags"] == recorder._NO_WINDOW_CREATIONFLAGS
 
 
 @REQUIRES_FFMPEG

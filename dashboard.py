@@ -15,6 +15,18 @@ import webbrowser
 from datetime import datetime
 
 
+_NO_WINDOW_CREATIONFLAGS = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+)
+
+
+def _run_hidden(command: list[str], **kwargs):
+    """Run a bundled command without allocating a Windows console window."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("creationflags", _NO_WINDOW_CREATIONFLAGS)
+    return subprocess.run(command, **kwargs)
+
+
 def _setup_dashboard_log() -> None:
     from maoer.process_manager import resolve_recordings_dir, resolve_state_dir
 
@@ -65,7 +77,7 @@ def _run_self_test() -> int:
     ffprobe = os.path.join(os.path.dirname(ffmpeg), ffprobe_name)
     for name, executable in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe)):
         try:
-            result = subprocess.run(
+            result = _run_hidden(
                 [executable, "-version"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -83,7 +95,7 @@ def _run_self_test() -> int:
             with tempfile.TemporaryDirectory(prefix="maoer-self-test-") as temp_dir:
                 adts_path = os.path.join(temp_dir, "sample.aac")
                 sample_path = os.path.join(temp_dir, "sample.m4a")
-                encode = subprocess.run(
+                encode = _run_hidden(
                     [
                         ffmpeg,
                         "-hide_banner",
@@ -114,7 +126,7 @@ def _run_self_test() -> int:
                     )
                     raise RuntimeError(f"ffmpeg exited with {encode.returncode}: {detail}")
 
-                mux = subprocess.run(
+                mux = _run_hidden(
                     [
                         ffmpeg,
                         "-hide_banner",
@@ -142,7 +154,7 @@ def _run_self_test() -> int:
                     )
                     raise RuntimeError(f"M4A mux exited with {mux.returncode}: {detail}")
 
-                probe = subprocess.run(
+                probe = _run_hidden(
                     [
                         ffprobe,
                         "-v", "error",

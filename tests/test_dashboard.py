@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import dashboard as dashboard_entry
 from maoer import config
 from maoer.dashboard import create_app
 from maoer.process_manager import RecordingManager, resolve_recordings_dir, validate_room_id
@@ -36,6 +39,28 @@ payload['state'] = 'stopped'
 payload['updated_at'] = time.time()
 status_path.write_text(json.dumps(payload), encoding='utf-8')
 """
+
+
+def test_dashboard_helpers_run_without_windows_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(dashboard_entry.subprocess, "run", fake_run)
+
+    result = dashboard_entry._run_hidden(["ffmpeg", "-version"])
+
+    assert result.returncode == 0
+    assert captured["command"] == ["ffmpeg", "-version"]
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["creationflags"] == dashboard_entry._NO_WINDOW_CREATIONFLAGS
 
 
 def wait_for(predicate, timeout: float = 5.0) -> None:

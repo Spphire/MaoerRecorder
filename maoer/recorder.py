@@ -63,6 +63,16 @@ _OUTPUT_CHANNELS = 2
 _OUTPUT_BIT_RATE = "128k"
 _AAC_FRAME_SAMPLES = 1024
 _FINAL_OUTPUT_NAME = "final.m4a"
+_NO_WINDOW_CREATIONFLAGS = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+)
+
+
+def _run_hidden(*popenargs: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+    """Run a media helper without allocating a Windows console window."""
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs.setdefault("creationflags", _NO_WINDOW_CREATIONFLAGS)
+    return subprocess.run(*popenargs, **kwargs)
 
 
 def _capture_audio_args() -> list[str]:
@@ -259,7 +269,12 @@ class FfmpegWorker:
                 log.debug("segments.jsonl write failed: %s", exc)
 
             self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0,
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                creationflags=_NO_WINDOW_CREATIONFLAGS,
             )
             threading.Thread(
                 target=self._stderr_reader, args=(self._proc, epoch),
@@ -568,7 +583,7 @@ def _ffprobe_path(ffmpeg_path: str) -> str:
 
 def _probe_duration(ffprobe: str, path: Path) -> float:
     try:
-        proc = subprocess.run(
+        proc = _run_hidden(
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
             check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -581,7 +596,7 @@ def _probe_duration(ffprobe: str, path: Path) -> float:
 def _probe_decoded_duration(ffmpeg: str, path: Path) -> float:
     """Measure the audio timeline after normalizing its source timestamps."""
     try:
-        proc = subprocess.run(
+        proc = _run_hidden(
             [
                 ffmpeg, "-v", "error", "-xerror", "-i", str(path),
                 "-map", "0:a:0",
@@ -611,7 +626,7 @@ def _probe_decoded_duration(ffmpeg: str, path: Path) -> float:
 def _probe_audio_runs(ffprobe: str, path: Path) -> list[tuple[float, float]]:
     """Return continuous audio PTS ranges, relative to the first packet."""
     try:
-        proc = subprocess.run(
+        proc = _run_hidden(
             [
                 ffprobe, "-v", "error", "-select_streams", "a:0",
                 "-show_entries", "packet=pts_time,duration_time",
@@ -717,7 +732,7 @@ def _scan_adts(path: Path) -> AdtsInfo | None:
 
 def _probe_audio_spec(ffprobe: str, path: Path) -> dict[str, Any]:
     try:
-        proc = subprocess.run(
+        proc = _run_hidden(
             [
                 ffprobe, "-v", "error", "-select_streams", "a:0",
                 "-show_entries",
@@ -797,7 +812,7 @@ def _extract_aac_copy(
         "-c:a", "copy", "-frames:a", str(frames), "-f", "adts", str(out),
     ]
     try:
-        proc = subprocess.run(
+        proc = _run_hidden(
             args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         info = _scan_adts(out) if proc.returncode == 0 else None
         return info if info and info.frames == frames else None
@@ -809,7 +824,7 @@ def _make_aac_silence(ffmpeg: str, out: Path, frames: int) -> AdtsInfo | None:
     """Encode silence, then frame-trim away the native AAC encoder flush."""
     encoded = out.with_name(f"{out.stem}.encoded.aac")
     try:
-        proc = subprocess.run(
+        proc = _run_hidden(
             [
                 ffmpeg, "-y", "-f", "lavfi", "-i",
                 f"anullsrc=channel_layout=stereo:sample_rate={_OUTPUT_SAMPLE_RATE}",
@@ -821,7 +836,7 @@ def _make_aac_silence(ffmpeg: str, out: Path, frames: int) -> AdtsInfo | None:
         )
         if proc.returncode != 0:
             return None
-        proc = subprocess.run(
+        proc = _run_hidden(
             [
                 ffmpeg, "-y", "-i", str(encoded), "-map", "0:a:0",
                 "-c:a", "copy", "-frames:a", str(frames), "-f", "adts", str(out),
@@ -852,7 +867,7 @@ def _join_adts(parts: list[Path], joined: Path) -> AdtsInfo | None:
 
 def _mux_adts_to_m4a(ffmpeg: str, joined: Path, out: Path) -> bool:
     try:
-        proc = subprocess.run(
+        proc = _run_hidden(
             [
                 ffmpeg, "-y", "-f", "aac", "-i", str(joined),
                 "-map", "0:a:0", "-c:a", "copy", "-bsf:a", "aac_adtstoasc",
@@ -870,7 +885,7 @@ def _mux_adts_to_m4a(ffmpeg: str, joined: Path, out: Path) -> bool:
 
 def _probe_packet_durations(ffprobe: str, path: Path) -> list[int]:
     try:
-        proc = subprocess.run(
+        proc = _run_hidden(
             [
                 ffprobe, "-v", "error", "-select_streams", "a:0",
                 "-show_entries", "packet=duration", "-of", "csv=p=0", str(path),
@@ -949,7 +964,7 @@ def _render_pcm_timeline(
                     "-ar", str(_OUTPUT_SAMPLE_RATE), "-ac", str(_OUTPUT_CHANNELS),
                     "-c:a", "pcm_s16le", "-f", "s16le", "-",
                 ]
-                proc = subprocess.run(
+                proc = _run_hidden(
                     args, check=False, stdout=target, stderr=subprocess.DEVNULL)
                 if proc.returncode != 0:
                     return False
@@ -966,7 +981,7 @@ def _render_pcm_timeline(
 
 def _encode_pcm_m4a(ffmpeg: str, pcm: Path, out: Path) -> bool:
     try:
-        proc = subprocess.run(
+        proc = _run_hidden(
             [
                 ffmpeg, "-y", "-f", "s16le", "-ar", str(_OUTPUT_SAMPLE_RATE),
                 "-ac", str(_OUTPUT_CHANNELS), "-i", str(pcm),
