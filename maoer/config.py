@@ -112,6 +112,16 @@ class Config:
     max_ws_silent_seconds: int = 120
     # How long to wait for live-end confirmation before finalizing.
     media_drain_seconds: int = 120
+    # Natural live-end detection leaves a no-media tail while the platform
+    # status catches up. Trim only that synthetic tail, never quiet source
+    # audio, and retain a short pad at the end.
+    trim_trailing_silence: bool = True
+    trailing_trim_min_seconds: float = 10.0
+    trailing_silence_keep_seconds: float = 2.0
+    # Consolidate the aligned A/B timeline into one MPEG-TS archive. Raw lane
+    # segments are removed only after both this archive and final.m4a validate.
+    archive_merged_ts: bool = True
+    delete_raw_segments_after_archive: bool = True
     # API polling cadence — relaxed to avoid robotic patterns.
     # When no session is active.
     idle_poll_seconds: float = 8.0
@@ -156,6 +166,18 @@ def load(room_id: int | None = None) -> Config:
         ffmpeg_path=ffmpeg,
         max_no_data_seconds=_env_int("MAOER_MAX_NO_DATA", 12),
         max_ws_silent_seconds=_env_int("MAOER_MAX_WS_SILENT", 120),
+        media_drain_seconds=max(0, _env_int("MAOER_MEDIA_DRAIN", 120)),
+        trim_trailing_silence=_env_int("MAOER_TRIM_TRAILING_SILENCE", 1) != 0,
+        trailing_trim_min_seconds=max(
+            0.0, _env_float("MAOER_TRAILING_TRIM_MIN", 10.0)
+        ),
+        trailing_silence_keep_seconds=max(
+            0.0, _env_float("MAOER_TRAILING_SILENCE_KEEP", 2.0)
+        ),
+        archive_merged_ts=_env_int("MAOER_ARCHIVE_MERGED_TS", 1) != 0,
+        delete_raw_segments_after_archive=(
+            _env_int("MAOER_DELETE_RAW_SEGMENTS", 1) != 0
+        ),
         idle_poll_seconds=_env_float("MAOER_IDLE_POLL", 8.0),
         active_poll_seconds=_env_float("MAOER_ACTIVE_POLL", 30.0),
         dual_record=_env_int("MAOER_DUAL_RECORD", 1) != 0,

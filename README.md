@@ -67,10 +67,11 @@ stop.bat            # Windows
 录制文件落在 `./recordings/<room>_<creator>/<timestamp>/`：
 
 - **`final.m4a`**：直播结束后自动合并去重生成的整段，采用 M4A 容器、AAC-LC、48 kHz 双声道，**时间轴已对齐**。源片段参数一致且校验通过时优先按 AAC 帧直通；不满足直通条件时，回退为重建完整 PCM 时间线后只做一次 AAC 编码
-- **`chat.jsonl`**：弹幕流，按时间偏移 `t_audio` 对齐音频（秒数直接对应成品音频的播放位置）
-- `meta.json`：元数据（含时长、来源拆分、中断归因 `gaps`）
-- `audio_A_*.ts`, `audio_B_*.ts`：两路分段音频原始文件（A/B 热备）
-- `segments.jsonl`：每段在时间轴上的起点，供对齐重建用
+- **`source_merged.ts`**：A 优先、B 补缺后的单路 MPEG-TS 重建主档，与 `final.m4a` 共享同一 AAC 时间线。仅在 AAC 帧直通和逐帧一致性校验成功时发布；它保留源 AAC 码流，但容器、时间戳和缺口静音已经重建，不是取证意义上的原始文件
+- **`chat.jsonl`**：完整弹幕流；裁尾后的音频仍保持从 0 开始的原时间偏移，播放或训练时忽略 `t_audio > audio_duration` 的尾部事件
+- `meta.json`：元数据（含录制/成品时长、来源拆分、中断归因 `gaps`、`trailing_trim` 与归档清理结果）
+- `segments.jsonl`：原 A/B 分段在时间轴上的起点，清理源分段后仍保留用于审计
+- `audio_A_*.ts`, `audio_B_*.ts`：录制期间的两路热备分段。`final.m4a` 和 `source_merged.ts` 均完整校验、AAC 逐帧一致且所有分段都已审计后才自动删除；回退转码、未知分段或任一收尾失败都会原样保留以便恢复
 
 旧场次的 `final.mp3` 和 `final.ts` 仍可被控制面板及状态脚本识别。升级不会自动转换历史录音，原文件会保持不变，避免再做一次有损转码。
 
@@ -85,6 +86,7 @@ stop.bat            # Windows
 - 各自独立录制 `audio_A_*.ts` / `audio_B_*.ts`，各有 watchdog 与崩溃恢复
 - 任一路崩溃/卡死时，另一路仍在录 → **覆盖不中断**
 - `finalize` 按时间轴去重合并：**A 路优先，A 的缺口用 B 路填，两路都缺才补静音**
+- 收尾优先生成一个 `source_merged.ts`；M4A、合并 TS 完整解码且 AAC 帧逐字节一致后才删除 A/B。若必须回退转码，则保留真正的源分段，不用转码后的重复容器冒充原始归档
 
 **Cookie 隔离防节流（关键）**：每路录制从「cookie 池」取一个**独立游客身份**（不同 `buvid3`/`MSESSID` + 各自签名 URL），控制路径（开播检测 + 弹幕）再单独占一个身份。这样服务端看到的是 N 个互不相关的观众，而不是「一个观众开 N 个流连接」——后者会被高人气房间节流。
 
@@ -102,11 +104,11 @@ stop.bat            # Windows
 
 - 每段录制启动时记录其在会话时间轴上的起点 `t_start`（与弹幕 `t_audio` 同一时钟）
 - 合并时按 `t_start` 走时间轴，缺口（双路都没覆盖）> 0.5s 则插入等长静音
-- 会话结束若最后一段之后仍有时间（末段崩溃丢失），补尾部静音到会话结束时刻
+- 会话结束若最后一段之后仍有时间，只裁“平台首次确认下播之后”仍在等待排空的无媒体尾差；该部分至少 10 秒时保留 2 秒。首次下播确认之前无法归因的缺口会完整保留。不会根据音量裁剪，因此主播真实的静音、停顿或低音量内容不会被误删
 
-**结果**：`final.m4a` 的时间轴 == 墙钟时间轴 == 弹幕 `t_audio`。
+**结果**：从 0 到成品结尾，`final.m4a`、`source_merged.ts` 与弹幕 `t_audio` 保持相同时间原点和偏移。被裁掉的是平台已确认下播后的等待尾差；原会话长度保留在 `duration` / `capture_duration`，成品终点记录在 `timeline_end_offset` / `audio_duration`，裁剪明细记录在 `trailing_trim`。
 
-任意一条弹幕的 `t_audio` 秒数，直接就是它在 `final.m4a` 里的播放位置。
+任意 `t_audio <= audio_duration` 的弹幕秒数，直接就是它在成品音频里的播放位置。
 
 ### 3. Supervisor 守护进程（推荐）
 
@@ -181,6 +183,12 @@ stop.bat            # Windows
 | `MAOER_WORKER_B_DELAY` | B 路错开启动秒数 | 8 |
 | `MAOER_MAX_NO_DATA` | ffmpeg 卡死判定（秒） | 12 |
 | `MAOER_MAX_WS_SILENT` | WS 静默超时（秒） | 120 |
+| `MAOER_MEDIA_DRAIN` | 停流后等待平台确认下播（秒） | 120 |
+| `MAOER_TRIM_TRAILING_SILENCE` | 裁剪自然下播产生的无媒体长尾（0 关闭） | 1 |
+| `MAOER_TRAILING_TRIM_MIN` | 触发尾裁的最短无媒体尾差（秒） | 10 |
+| `MAOER_TRAILING_SILENCE_KEEP` | 尾裁后保留的短静音（秒） | 2 |
+| `MAOER_ARCHIVE_MERGED_TS` | 生成双路互补后的单一 `source_merged.ts`（0 关闭） | 1 |
+| `MAOER_DELETE_RAW_SEGMENTS` | 合并 TS 与 M4A 均验证后删除 A/B 分段（0 保留） | 1 |
 | `MAOER_IDLE_POLL` | 空闲检测开播间隔（秒） | 8 |
 | `MAOER_ACTIVE_POLL` | 录制中刷新 URL 间隔（秒） | 30 |
 | `MAOER_LOG_LEVEL` | 日志级别 | INFO |
@@ -190,7 +198,7 @@ stop.bat            # Windows
 - **游客模式**：HTTP API、HLS 流、WebSocket 弹幕都不需要登录。Playwright 开临时无头浏览器，页面加载后自动获得必需的临时 cookie，录制全程无需人工介入。
 - **无状态**：不保存 profile，每次启动都是干净的临时 context。
 - **Cookie 池**：启动时预热 N 个独立游客身份（每个都是完整的浏览器 context），录制时按需分配，用完归还，烧毁后轮换。
-- **时间对齐**：所有时间戳（弹幕 `t_audio`、段 `t_start`、session 墙钟）共享同一 `time.time()` 时钟，合并时按时间轴走，缺口补 silence 保证对齐。
+- **时间对齐**：所有时间戳（弹幕 `t_audio`、段 `t_start`、session 墙钟）共享同一单调时钟，合并时按时间轴走，内部缺口补 silence；自然下播只裁时间轴末尾的合成无媒体尾差，保留前缀的偏移不变。
 
 ## 故障排查
 
@@ -235,7 +243,7 @@ stop.bat            # Windows
 ## 工具脚本
 
 ```bash
-# 分析两路覆盖率：精确统计"两路同时空窗"的时刻与时长（需先录制生成 session）
+# 分析两路覆盖率：源分段尚在时重新探测，清理后从 meta.json 输出已审计结果
 python analyze_coverage.py recordings/<room>_<creator>/<timestamp>/
 
 # 网络健康探针：区分本地 vs 远端网络波动（录制期间并行运行）

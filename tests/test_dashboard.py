@@ -164,6 +164,7 @@ def test_recording_stats_resolve_mixed_final_outputs_safely(tmp_path: Path) -> N
     missing_explicit = room / "20260709_010203"
     non_audio = room / "20260710_010203"
     empty_output = room / "20260711_010203"
+    archive_only = room / "20260712_010203"
     sessions = (
         m4a,
         legacy_mp3,
@@ -176,6 +177,7 @@ def test_recording_stats_resolve_mixed_final_outputs_safely(tmp_path: Path) -> N
         missing_explicit,
         non_audio,
         empty_output,
+        archive_only,
     )
     for session in sessions:
         session.mkdir(parents=True)
@@ -229,6 +231,9 @@ def test_recording_stats_resolve_mixed_final_outputs_safely(tmp_path: Path) -> N
     (empty_output / "meta.json").write_text(
         json.dumps({"output": "final.m4a", "audio_duration": 999}), encoding="utf-8"
     )
+    # The merged source archive is not a playback final and must never make an
+    # interrupted session look finalized by itself.
+    (archive_only / "source_merged.ts").write_bytes(b"merged-source")
 
     value = RecordingManager(recordings, tmp_path / "state", monitor=False)
     try:

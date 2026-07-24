@@ -63,6 +63,7 @@ _OUTPUT_CHANNELS = 2
 _OUTPUT_BIT_RATE = "128k"
 _AAC_FRAME_SAMPLES = 1024
 _FINAL_OUTPUT_NAME = "final.m4a"
+_MERGED_SOURCE_NAME = "source_merged.ts"
 _NO_WINDOW_CREATIONFLAGS = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 )
@@ -147,6 +148,7 @@ class FfmpegWorker:
 
         self._proc: subprocess.Popen[bytes] | None = None
         self._proc_lock = threading.Lock()
+        self._stderr_threads: list[threading.Thread] = []
         self._epoch = 0
         self.segment_index = 0
         self._current_segment: Path | None = None
@@ -181,6 +183,21 @@ class FfmpegWorker:
     def stop(self) -> None:
         self._stopped.set()
         self._kill()
+
+    def join(self, timeout: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        threads = [self._thread, *self._stderr_threads]
+        for thread in threads:
+            if not thread or thread is threading.current_thread():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        alive = [thread.name for thread in threads if thread and thread.is_alive()]
+        if alive:
+            log.warning("[%s] worker threads still alive after stop: %s",
+                        self.label, ", ".join(alive))
 
     def _run(self) -> None:
         if self._start_delay > 0:
@@ -276,10 +293,12 @@ class FfmpegWorker:
                 bufsize=0,
                 creationflags=_NO_WINDOW_CREATIONFLAGS,
             )
-            threading.Thread(
+            stderr_thread = threading.Thread(
                 target=self._stderr_reader, args=(self._proc, epoch),
                 daemon=True, name=f"stderr-{self.label}-{epoch}",
-            ).start()
+            )
+            self._stderr_threads.append(stderr_thread)
+            stderr_thread.start()
 
     def _stderr_reader(self, proc: subprocess.Popen[bytes], epoch: int) -> None:
         stream = proc.stderr
@@ -323,6 +342,7 @@ class FfmpegWorker:
                 except Exception:
                     try:
                         proc.kill()
+                        proc.wait(timeout=2)
                     except Exception:
                         pass
 
@@ -443,6 +463,8 @@ class RecordSession:
         self.start_wall = time.time()
         self.start_mono = time.monotonic()
         self.end_offset: float | None = None
+        self.stop_reason: str | None = None
+        self.live_offline_offset: float | None = None
 
         self._stopped = threading.Event()
 
@@ -506,13 +528,25 @@ class RecordSession:
             return
         log.info("session stop: %s", reason)
         self.end_offset = round(time.monotonic() - self.start_mono, 3)
+        self.stop_reason = reason
         self._stopped.set()
         for w in self.workers:
             w.stop()
+        for w in self.workers:
+            w.join()
         try:
             self._chat_q.put_nowait("")
         except queue.Full:
             pass
+
+    def mark_live_offline(self) -> None:
+        if self.live_offline_offset is None:
+            self.live_offline_offset = round(
+                time.monotonic() - self.start_mono, 3
+            )
+
+    def mark_live_online(self) -> None:
+        self.live_offline_offset = None
 
     # ---------- chat ----------
 
@@ -803,9 +837,11 @@ def _extract_aac_copy(
 ) -> AdtsInfo | None:
     """Copy a frame-aligned AAC interval from an input segment to ADTS."""
     frame_seconds = _AAC_FRAME_SAMPLES / _OUTPUT_SAMPLE_RATE
+    seek_frame = int(max(0.0, seek) / frame_seconds + 0.5)
+    aligned_seek = seek_frame * frame_seconds
     args = [ffmpeg, "-y", "-i", str(src)]
-    if seek > 0.000001:
-        args += ["-ss", f"{max(0.0, seek - 0.000001):.6f}"]
+    if aligned_seek > 0.000001:
+        args += ["-ss", f"{max(0.0, aligned_seek - 0.000001):.6f}"]
     args += [
         "-map", "0:a:0", "-vn", "-sn", "-dn",
         "-t", f"{max(take, frames * frame_seconds) + frame_seconds:.6f}",
@@ -883,6 +919,25 @@ def _mux_adts_to_m4a(ffmpeg: str, joined: Path, out: Path) -> bool:
         return False
 
 
+def _mux_m4a_to_ts(ffmpeg: str, source: Path, out: Path) -> bool:
+    """Remux the validated canonical AAC track into one MPEG-TS archive."""
+    try:
+        proc = _run_hidden(
+            [
+                ffmpeg, "-y", "-i", str(source),
+                "-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a", "copy",
+                "-mpegts_flags", "+resend_headers", "-f", "mpegts", str(out),
+            ],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+            log.warning("merged TS remux failed: %s", tail)
+        return proc.returncode == 0 and out.exists() and out.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def _probe_packet_durations(ffprobe: str, path: Path) -> list[int]:
     try:
         proc = _run_hidden(
@@ -926,6 +981,172 @@ def _validate_m4a(
     if duration <= 0 or abs(duration - expected_duration) > tolerance:
         return None
     return info, duration
+
+
+def _demux_to_adts(ffmpeg: str, source: Path, out: Path) -> bool:
+    try:
+        proc = _run_hidden(
+            [
+                ffmpeg, "-y", "-i", str(source),
+                "-map", "0:a:0", "-vn", "-sn", "-dn",
+                "-c:a", "copy", "-f", "adts", str(out),
+            ],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return proc.returncode == 0 and out.exists() and out.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _files_equal(left: Path, right: Path) -> bool:
+    try:
+        if left.stat().st_size != right.stat().st_size:
+            return False
+        with left.open("rb") as left_stream, right.open("rb") as right_stream:
+            while True:
+                left_chunk = left_stream.read(1024 * 1024)
+                right_chunk = right_stream.read(1024 * 1024)
+                if left_chunk != right_chunk:
+                    return False
+                if not left_chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def _validate_merged_ts(
+    ffmpeg: str, ffprobe: str, path: Path, expected_frames: int,
+    canonical_adts: Path,
+) -> tuple[dict[str, Any], float] | None:
+    """Validate the TS and prove its AAC access units match the canonical track."""
+    info = _probe_audio_spec(ffprobe, path)
+    if (
+        info.get("codec_name") != "aac"
+        or info.get("profile") != "LC"
+        or info.get("sample_rate") != _OUTPUT_SAMPLE_RATE
+        or info.get("channels") != _OUTPUT_CHANNELS
+    ):
+        return None
+    duration = _probe_decoded_duration(ffmpeg, path)
+    expected_duration = expected_frames * _AAC_FRAME_SAMPLES / _OUTPUT_SAMPLE_RATE
+    tolerance = 3 * _AAC_FRAME_SAMPLES / _OUTPUT_SAMPLE_RATE
+    if duration <= 0 or abs(duration - expected_duration) > tolerance:
+        return None
+    extracted = path.with_name("source_merged.validate.aac")
+    try:
+        if not _demux_to_adts(ffmpeg, path, extracted):
+            return None
+        canonical_info = _scan_adts(canonical_adts)
+        extracted_info = _scan_adts(extracted)
+        if (
+            not canonical_info
+            or not extracted_info
+            or canonical_info.frames != expected_frames
+            or extracted_info.frames != expected_frames
+            or extracted_info.config != canonical_info.config
+            or not _files_equal(extracted, canonical_adts)
+        ):
+            return None
+        return info, duration
+    finally:
+        try:
+            extracted.unlink()
+        except OSError:
+            pass
+
+
+def _trim_trailing_padding(
+    plan: list[tuple],
+    gaps: list[dict[str, Any]],
+    end: float,
+    silence_coverage: float,
+    *,
+    enabled: bool,
+    threshold: float,
+    keep: float,
+    safe_start: float | None,
+) -> tuple[float, float, dict[str, Any]]:
+    """Shorten only a synthetic no-media tail already present in the plan."""
+    result: dict[str, Any] = {
+        "applied": False,
+        "reason": "no_confirmed_offline_boundary",
+        "detected_seconds": 0.0,
+        "confirmed_offline_seconds": 0.0,
+        "pre_offline_seconds": 0.0,
+        "kept_seconds": 0.0,
+        "removed_seconds": 0.0,
+    }
+    if (
+        not plan
+        or plan[-1][0] != "silence"
+        or not gaps
+        or not gaps[-1].get("trailing")
+    ):
+        return end, silence_coverage, result
+
+    detected = max(0.0, float(plan[-1][1]))
+    result["detected_seconds"] = round(detected, 3)
+    result["kept_seconds"] = round(detected, 3)
+    tail_start = end - detected
+    if safe_start is None:
+        return end, silence_coverage, result
+    safe_start = min(end, max(tail_start, float(safe_start)))
+    pre_offline = safe_start - tail_start
+    confirmed = end - safe_start
+    result.update(
+        {
+            "reason": "confirmed_offline_no_media",
+            "confirmed_offline_seconds": round(confirmed, 3),
+            "pre_offline_seconds": round(pre_offline, 3),
+        }
+    )
+    threshold = max(0.0, float(threshold))
+    keep = min(confirmed, max(0.0, float(keep)))
+    if not enabled or confirmed < threshold or confirmed <= keep:
+        return end, silence_coverage, result
+
+    removed = confirmed - keep
+    retained_tail = pre_offline + keep
+    if retained_tail > 0.000001:
+        plan[-1] = ("silence", retained_tail)
+        gaps[-1]["original_dur"] = round(detected, 1)
+        gaps[-1]["dur"] = round(retained_tail, 1)
+        gaps[-1]["trimmed"] = round(removed, 1)
+    else:
+        plan.pop()
+        gaps.pop()
+
+    result.update(
+        {
+            "applied": True,
+            "kept_seconds": round(retained_tail, 3),
+            "removed_seconds": round(removed, 3),
+        }
+    )
+    return end - removed, max(0.0, silence_coverage - removed), result
+
+
+def _source_segment_files(session_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in session_dir.glob("audio_[A-D]_*.ts")
+        if path.is_file()
+    )
+
+
+def _remove_source_segments(paths: list[Path]) -> tuple[int, int, list[Path]]:
+    removed = 0
+    removed_bytes = 0
+    for path in paths:
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            removed += 1
+            removed_bytes += size
+        except OSError as exc:
+            log.warning("raw segment cleanup failed for %s: %s", path.name, exc)
+    remaining = [path for path in paths if path.exists()]
+    return removed, removed_bytes, remaining
 
 
 def _write_zeros(stream: Any, size: int) -> None:
@@ -1052,6 +1273,11 @@ def finalize(session: RecordSession) -> None:
     for w in session.workers:
         lanes[w.label] = _collect_lane(
             ffmpeg, ffprobe, session.session_dir, w.segments)
+    audited_source_paths = {
+        Path(item["path"]).resolve()
+        for lane in lanes.values()
+        for item in lane
+    }
     primary = lanes.get("A", [])
     backups: list[list[dict]] = [lanes[k] for k in lanes if k != "A"]
     backup = backups[0] if backups else []
@@ -1067,6 +1293,7 @@ def finalize(session: RecordSession) -> None:
         if session.end_offset is not None
         else (max(all_ends) if all_ends else 0.0)
     )
+    capture_end = end
 
     # Greedy timeline walk: A preferred, B fills A's gaps, else silence.
     plan: list[tuple] = []  # ('audio', path, seek, take) | ('silence', dur)
@@ -1118,6 +1345,35 @@ def finalize(session: RecordSession) -> None:
                      "trailing": True})
         cov_sil += end - timeline
 
+    trim_threshold = float(
+        getattr(session.cfg, "trailing_trim_min_seconds", 10.0)
+    )
+    trim_keep = float(
+        getattr(session.cfg, "trailing_silence_keep_seconds", 2.0)
+    )
+    trim_enabled = bool(
+        getattr(session.cfg, "trim_trailing_silence", True)
+        and getattr(session, "stop_reason", None) == "live ended"
+    )
+    end, cov_sil, trailing_trim = _trim_trailing_padding(
+        plan,
+        gaps,
+        end,
+        cov_sil,
+        enabled=trim_enabled,
+        threshold=trim_threshold,
+        keep=trim_keep,
+        safe_start=getattr(session, "live_offline_offset", None),
+    )
+    trailing_trim["threshold_seconds"] = round(max(0.0, trim_threshold), 3)
+    trailing_trim["configured_keep_seconds"] = round(max(0.0, trim_keep), 3)
+    if trailing_trim["applied"]:
+        log.info(
+            "trimmed synthetic trailing silence: %.1fs -> %.1fs",
+            trailing_trim["detected_seconds"],
+            trailing_trim["kept_seconds"],
+        )
+
     quantized, total_frames = _quantize_plan(plan)
     parts_dir = session.session_dir / "_parts"
     parts_dir.mkdir(exist_ok=True)
@@ -1130,13 +1386,20 @@ def finalize(session: RecordSession) -> None:
 
     final = session.session_dir / _FINAL_OUTPUT_NAME
     partial = session.session_dir / "final.partial.m4a"
+    archive = session.session_dir / _MERGED_SOURCE_NAME
+    archive_partial = session.session_dir / "source_merged.partial.ts"
     joined = parts_dir / "joined.aac"
     pcm = parts_dir / "timeline.s16le"
     ok = False
+    archive_ok = False
+    archive_validated = False
+    archive_requested = bool(getattr(session.cfg, "archive_merged_ts", True))
     processing_mode = "passthrough"
     fallback_reason: str | None = None
     media_info: dict[str, Any] = {}
+    archive_info: dict[str, Any] = {}
     final_dur = 0.0
+    archive_dur = 0.0
 
     source_paths = {
         item[1] for item, _frames in quantized if item[0] == "audio"
@@ -1209,6 +1472,22 @@ def finalize(session: RecordSession) -> None:
                 media_info, final_dur = validated
                 ok = True
 
+    archive_eligible = bool(ok and processing_mode == "passthrough")
+    if archive_eligible and archive_requested:
+        try:
+            archive_partial.unlink()
+        except OSError:
+            pass
+        if _mux_m4a_to_ts(ffmpeg, partial, archive_partial):
+            archive_validation = _validate_merged_ts(
+                ffmpeg, ffprobe, archive_partial, total_frames, joined
+            )
+            if archive_validation:
+                archive_info, archive_dur = archive_validation
+                archive_validated = True
+            else:
+                log.warning("merged TS validation failed; preserving raw segments")
+
     if ok:
         try:
             os.replace(partial, final)
@@ -1216,7 +1495,66 @@ def finalize(session: RecordSession) -> None:
             log.warning("publishing final M4A failed: %s", exc)
             ok = False
 
-    for temp in (partial, joined, pcm):
+    if ok and archive_validated:
+        try:
+            os.replace(archive_partial, archive)
+            archive_ok = True
+        except OSError as exc:
+            log.warning("publishing merged TS failed: %s", exc)
+
+    raw_segments = _source_segment_files(session.session_dir)
+    raw_bytes_before = 0
+    for path in raw_segments:
+        try:
+            raw_bytes_before += path.stat().st_size
+        except OSError:
+            pass
+    unverified_segments = [
+        path for path in raw_segments if path.resolve() not in audited_source_paths
+    ]
+    removed_segments = 0
+    removed_bytes = 0
+    remaining_segments = list(raw_segments)
+    delete_raw = bool(
+        getattr(session.cfg, "delete_raw_segments_after_archive", True)
+    )
+    if ok and archive_ok and delete_raw and not unverified_segments:
+        removed_segments, removed_bytes, remaining_segments = (
+            _remove_source_segments(raw_segments)
+        )
+        if remaining_segments:
+            log.warning(
+                "merged archive published but %d raw segment(s) remain",
+                len(remaining_segments),
+            )
+        else:
+            log.info(
+                "merged archive published; removed %d raw segment(s) (%.1f MiB)",
+                removed_segments,
+                removed_bytes / (1024 * 1024),
+            )
+    elif unverified_segments:
+        log.warning(
+            "preserving all raw segments: %d file(s) were not validated",
+            len(unverified_segments),
+        )
+
+    if not archive_requested:
+        cleanup_reason = "archive_disabled"
+    elif ok and processing_mode != "passthrough":
+        cleanup_reason = "transcoded_final"
+    elif not archive_ok:
+        cleanup_reason = "archive_failed"
+    elif not delete_raw:
+        cleanup_reason = "retained_by_config"
+    elif unverified_segments:
+        cleanup_reason = "unverified_segments"
+    elif remaining_segments:
+        cleanup_reason = "partial_cleanup"
+    else:
+        cleanup_reason = "complete"
+
+    for temp in (partial, archive_partial, joined, pcm):
         try:
             temp.unlink()
         except OSError:
@@ -1233,13 +1571,15 @@ def finalize(session: RecordSession) -> None:
         except OSError:
             pass
 
-    wall = round(time.monotonic() - session.start_mono, 2)
-    duration = round(session.end_offset if session.end_offset is not None else wall, 2)
+    duration = round(capture_end, 2)
     meta = {
         "room_id": session.room_id,
         "start_time": session.start_wall,
         "duration": duration,
+        "capture_duration": round(capture_end, 2),
+        "timeline_end_offset": round(end, 2),
         "audio_duration": round(final_dur, 2),
+        "stop_reason": getattr(session, "stop_reason", None),
         "dual_record": len(session.workers) > 1,
         "source_breakdown": {
             "primary_A": round(cov_a, 1),
@@ -1250,8 +1590,11 @@ def finalize(session: RecordSession) -> None:
         # offset into the final audio. Cross-check each against record.log's per-lane
         # restart timestamps to confirm both lanes were truly down.
         "gaps": gaps,
+        "trailing_trim": trailing_trim,
         "output": _FINAL_OUTPUT_NAME if ok else "(failed)",
         "timeline_aligned": ok,
+        "timeline_aligned_until": round(final_dur, 2) if ok else None,
+        "timeline_origin_preserved": bool(ok),
         "audio_codec": media_info.get("codec_name") if ok else None,
         "audio_profile": media_info.get("profile") if ok else None,
         "audio_sample_rate": media_info.get("sample_rate") if ok else None,
@@ -1261,12 +1604,56 @@ def finalize(session: RecordSession) -> None:
         "processing_mode": processing_mode if ok else "failed",
         "source_audio_passthrough": bool(ok and processing_mode == "passthrough"),
         "fallback_reason": fallback_reason if processing_mode == "transcoded" else None,
+        "archive": {
+            "output": (
+                _MERGED_SOURCE_NAME
+                if archive_ok
+                else (
+                    "(skipped)"
+                    if archive_requested and ok and processing_mode != "passthrough"
+                    else ("(failed)" if archive_requested and ok else None)
+                )
+            ),
+            "validated": archive_ok,
+            "duration": round(archive_dur, 2) if archive_ok else None,
+            "container": "mpegts" if archive_ok else None,
+            "audio_codec": archive_info.get("codec_name") if archive_ok else None,
+            "source_audio_passthrough": bool(
+                archive_ok and processing_mode == "passthrough"
+            ),
+            "raw_segments_found": len(raw_segments),
+            "raw_bytes_before": raw_bytes_before,
+            "raw_segments_removed": removed_segments,
+            "raw_bytes_removed": removed_bytes,
+            "raw_segments_unverified": len(unverified_segments),
+            "raw_unverified_files": [
+                path.name for path in unverified_segments
+            ],
+            "raw_cleanup_complete": bool(
+                archive_ok
+                and delete_raw
+                and not unverified_segments
+                and not remaining_segments
+            ),
+            "raw_segments_remaining": len(remaining_segments),
+            "raw_cleanup_reason": cleanup_reason,
+        },
     }
     (session.session_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    archive_label = (
+        _MERGED_SOURCE_NAME
+        if archive_ok
+        else (
+            "disabled"
+            if not archive_requested
+            else ("skipped-transcode" if ok and processing_mode != "passthrough" else "FAILED")
+        )
+    )
     log.info(
-        "final: %s | dur=%.0fs (A=%.0fs B=%.0fs sil=%.0fs)",
+        "final: %s | archive=%s | dur=%.0fs (A=%.0fs B=%.0fs sil=%.0fs)",
         _FINAL_OUTPUT_NAME if ok else "FAILED",
+        archive_label,
         final_dur, cov_a, cov_b, cov_sil,
     )

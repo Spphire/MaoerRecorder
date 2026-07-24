@@ -22,7 +22,7 @@ Run the examples with `pwsh` when PowerShell 7 is available. On Windows PowerShe
 1. Inspect the branch, tracking branch, worktree, and existing release tag. Resolve unexpected dirty or behind state before publishing.
 2. Run the default test and syntax checks. Do not use `-SkipTests` unless the user explicitly accepts the risk.
 3. Build the onedir package in a temporary staging directory. The script provisions `.build-venv` and bundled Playwright Chromium when needed, and locates ffmpeg/ffprobe for PyInstaller.
-4. Run the frozen EXE's `--self-test` with isolated temporary state. ffmpeg, ffprobe, AAC-to-M4A muxing, and Chromium checks must pass.
+4. Run the frozen EXE's `--self-test` with isolated temporary state. ffmpeg, ffprobe, AAC-to-M4A muxing, merged MPEG-TS remux/decode, and Chromium checks must pass.
 5. Audit required bundle files and reject forbidden runtime data.
 6. Create `MaoerRecorder-v<version>-windows-x64.zip` and its `.sha256` companion. Verify the hash and archive contents.
 7. Without `-Publish`, stop after producing local artifacts. With `-Push -Publish`, push the current branch and create or update the matching GitHub Release, then verify both assets and the release URL.

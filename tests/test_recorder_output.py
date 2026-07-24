@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from maoer import recorder
+from maoer import config, recorder
 
 
 FFMPEG = shutil.which("ffmpeg")
@@ -35,6 +35,7 @@ def _make_aac_ts(
     sample_rate: int = 48000,
     channels: int = 2,
     duration: float = 2.2,
+    frequency: int = 440,
 ) -> None:
     _run(
         [
@@ -45,7 +46,7 @@ def _make_aac_ts(
             "-f",
             "lavfi",
             "-i",
-            f"sine=frequency=440:sample_rate={sample_rate}:duration={duration}",
+            f"sine=frequency={frequency}:sample_rate={sample_rate}:duration={duration}",
             "-map",
             "0:a:0",
             "-ac",
@@ -139,10 +140,19 @@ def _session(tmp_path: Path, source: Path, *, label: str = "A") -> SimpleNamespa
     )
     return SimpleNamespace(
         segment_index=1,
-        cfg=SimpleNamespace(ffmpeg_path=str(FFMPEG)),
+        cfg=SimpleNamespace(
+            ffmpeg_path=str(FFMPEG),
+            archive_merged_ts=True,
+            delete_raw_segments_after_archive=True,
+            trim_trailing_silence=True,
+            trailing_trim_min_seconds=10.0,
+            trailing_silence_keep_seconds=2.0,
+        ),
         session_dir=tmp_path,
         workers=[worker],
         end_offset=1.0,
+        stop_reason="live ended",
+        live_offline_offset=None,
         start_mono=time.monotonic() - 99.0,
         start_wall=123.0,
         room_id=456,
@@ -159,6 +169,47 @@ def _long_source_run(source: Path) -> list[dict]:
             "source_start": 0.0,
         }
     ]
+
+
+def test_finalize_storage_config_defaults_and_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MAOER_BASE_DIR", str(tmp_path / "recordings"))
+    monkeypatch.setattr(config, "_resolve_ffmpeg", lambda: "ffmpeg")
+    names = (
+        "MAOER_MEDIA_DRAIN",
+        "MAOER_TRIM_TRAILING_SILENCE",
+        "MAOER_TRAILING_TRIM_MIN",
+        "MAOER_TRAILING_SILENCE_KEEP",
+        "MAOER_ARCHIVE_MERGED_TS",
+        "MAOER_DELETE_RAW_SEGMENTS",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    defaults = config.load(123)
+    assert defaults.media_drain_seconds == 120
+    assert defaults.trim_trailing_silence is True
+    assert defaults.trailing_trim_min_seconds == 10.0
+    assert defaults.trailing_silence_keep_seconds == 2.0
+    assert defaults.archive_merged_ts is True
+    assert defaults.delete_raw_segments_after_archive is True
+
+    monkeypatch.setenv("MAOER_MEDIA_DRAIN", "45")
+    monkeypatch.setenv("MAOER_TRIM_TRAILING_SILENCE", "0")
+    monkeypatch.setenv("MAOER_TRAILING_TRIM_MIN", "20.5")
+    monkeypatch.setenv("MAOER_TRAILING_SILENCE_KEEP", "3.5")
+    monkeypatch.setenv("MAOER_ARCHIVE_MERGED_TS", "0")
+    monkeypatch.setenv("MAOER_DELETE_RAW_SEGMENTS", "0")
+
+    overridden = config.load(123)
+    assert overridden.media_drain_seconds == 45
+    assert overridden.trim_trailing_silence is False
+    assert overridden.trailing_trim_min_seconds == 20.5
+    assert overridden.trailing_silence_keep_seconds == 3.5
+    assert overridden.archive_merged_ts is False
+    assert overridden.delete_raw_segments_after_archive is False
 
 
 def test_capture_worker_uses_audio_stream_copy(
@@ -269,6 +320,150 @@ def test_quantize_plan_rounds_on_one_cumulative_grid() -> None:
 
 
 @pytest.mark.parametrize(
+    ("tail", "applied", "expected_end"),
+    [(9.9, False, 10.9), (10.0, True, 3.0), (15.0, True, 3.0)],
+)
+def test_trailing_padding_trim_threshold(
+    tail: float, applied: bool, expected_end: float
+) -> None:
+    plan: list[tuple] = [
+        ("audio", Path("source.ts"), 0.0, 1.0),
+        ("silence", tail),
+    ]
+    gaps = [{"at": 1.0, "dur": tail, "trailing": True}]
+
+    end, silence, details = recorder._trim_trailing_padding(
+        plan,
+        gaps,
+        1.0 + tail,
+        tail,
+        enabled=True,
+        threshold=10.0,
+        keep=2.0,
+        safe_start=1.0,
+    )
+
+    assert details["applied"] is applied
+    assert end == pytest.approx(expected_end)
+    assert silence == pytest.approx(2.0 if applied else tail)
+    assert plan[-1][1] == pytest.approx(2.0 if applied else tail)
+
+
+def test_trailing_trim_never_removes_internal_or_source_silence() -> None:
+    plan: list[tuple] = [
+        ("audio", Path("quiet-source.ts"), 0.0, 20.0),
+        ("silence", 30.0),
+        ("audio", Path("source.ts"), 20.0, 1.0),
+    ]
+    gaps = [{"at": 20.0, "dur": 30.0}]
+
+    end, silence, details = recorder._trim_trailing_padding(
+        plan,
+        gaps,
+        51.0,
+        30.0,
+        enabled=True,
+        threshold=10.0,
+        keep=2.0,
+        safe_start=0.0,
+    )
+
+    assert details["applied"] is False
+    assert end == 51.0
+    assert silence == 30.0
+    assert plan[-1][0] == "audio"
+
+
+def test_trailing_trim_preserves_unconfirmed_pre_offline_gap() -> None:
+    plan: list[tuple] = [
+        ("audio", Path("source.ts"), 0.0, 1.0),
+        ("silence", 120.0),
+    ]
+    gaps = [{"at": 1.0, "dur": 120.0, "trailing": True}]
+
+    end, silence, details = recorder._trim_trailing_padding(
+        plan,
+        gaps,
+        121.0,
+        120.0,
+        enabled=True,
+        threshold=10.0,
+        keep=2.0,
+        safe_start=11.0,
+    )
+
+    assert end == 13.0
+    assert silence == 12.0
+    assert details["applied"] is True
+    assert details["pre_offline_seconds"] == 10.0
+    assert details["confirmed_offline_seconds"] == 110.0
+    assert details["kept_seconds"] == 12.0
+    assert details["removed_seconds"] == 108.0
+
+
+def test_trailing_trim_requires_confirmed_offline_boundary() -> None:
+    plan: list[tuple] = [("silence", 120.0)]
+    gaps = [{"at": 0.0, "dur": 120.0, "trailing": True}]
+
+    end, silence, details = recorder._trim_trailing_padding(
+        plan,
+        gaps,
+        120.0,
+        120.0,
+        enabled=True,
+        threshold=10.0,
+        keep=2.0,
+        safe_start=None,
+    )
+
+    assert (end, silence) == (120.0, 120.0)
+    assert details["applied"] is False
+    assert details["reason"] == "no_confirmed_offline_boundary"
+
+
+@REQUIRES_FFMPEG
+def test_extract_aac_copy_snaps_non_aligned_seek_to_packet_grid(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.ts"
+    out = tmp_path / "slice.aac"
+    _make_aac_ts(source, duration=2.2)
+
+    info = recorder._extract_aac_copy(
+        str(FFMPEG), source, seek=0.982333, take=1.1, frames=48, out=out
+    )
+
+    assert info is not None
+    assert info.frames == 48
+    _assert_fully_decodable(out)
+
+
+@REQUIRES_FFMPEG
+def test_merged_ts_validation_rejects_same_length_wrong_aac_payload(
+    tmp_path: Path,
+) -> None:
+    canonical_source = tmp_path / "canonical.ts"
+    wrong_archive = tmp_path / "wrong.ts"
+    canonical_adts = tmp_path / "canonical.aac"
+    _make_aac_ts(canonical_source, duration=1.0, frequency=440)
+    _make_aac_ts(wrong_archive, duration=1.0, frequency=880)
+    _remux_to_adts(canonical_source, canonical_adts)
+    canonical_info = recorder._scan_adts(canonical_adts)
+    assert canonical_info is not None
+
+    validated = recorder._validate_merged_ts(
+        str(FFMPEG),
+        str(FFPROBE),
+        wrong_archive,
+        canonical_info.frames,
+        canonical_adts,
+    )
+
+    assert validated is None
+    assert not (tmp_path / "source_merged.validate.aac").exists()
+
+
+@pytest.mark.parametrize(
     ("label", "breakdown_key"),
     [("A", "primary_A"), ("B", "backup_B")],
     ids=["primary", "backup"],
@@ -287,30 +482,39 @@ def test_finalize_passthrough_is_packet_preserving_and_clamped_to_end_offset(
         recorder, "_collect_lane", lambda *_args: _long_source_run(source)
     )
 
-    recorder.finalize(session)
-
-    final = tmp_path / "final.m4a"
-    assert final.exists()
-    assert not (tmp_path / "final.mp3").exists()
-    assert not (tmp_path / "final.partial.m4a").exists()
-    assert not (tmp_path / "_parts").exists()
-    _assert_fully_decodable(final)
-
     expected_frames = int(
         session.end_offset
         * recorder._OUTPUT_SAMPLE_RATE
         / recorder._AAC_FRAME_SAMPLES
         + 0.5
     )
+    expected_adts = tmp_path / "expected.aac"
+    _remux_to_adts(source, expected_adts, frames=expected_frames)
+
+    recorder.finalize(session)
+
+    final = tmp_path / "final.m4a"
+    archive = tmp_path / "source_merged.ts"
+    assert final.exists()
+    assert archive.exists()
+    assert not source.exists()
+    assert not (tmp_path / "final.mp3").exists()
+    assert not (tmp_path / "final.partial.m4a").exists()
+    assert not (tmp_path / "source_merged.partial.ts").exists()
+    assert not (tmp_path / "_parts").exists()
+    _assert_fully_decodable(final)
+    _assert_fully_decodable(archive)
+
     packet_durations = recorder._probe_packet_durations(str(FFPROBE), final)
     assert len(packet_durations) == expected_frames
     assert set(packet_durations) == {recorder._AAC_FRAME_SAMPLES}
 
-    expected_adts = tmp_path / "expected.aac"
     actual_adts = tmp_path / "actual.aac"
-    _remux_to_adts(source, expected_adts, frames=expected_frames)
+    archive_adts = tmp_path / "archive.aac"
     _remux_to_adts(final, actual_adts)
+    _remux_to_adts(archive, archive_adts)
     assert actual_adts.read_bytes() == expected_adts.read_bytes()
+    assert archive_adts.read_bytes() == expected_adts.read_bytes()
 
     stream, container = _probe_audio(final)
     assert stream["codec_name"] == "aac"
@@ -342,6 +546,11 @@ def test_finalize_passthrough_is_packet_preserving_and_clamped_to_end_offset(
     assert meta["processing_mode"] == "passthrough"
     assert meta["source_audio_passthrough"] is True
     assert meta["fallback_reason"] is None
+    assert meta["archive"]["output"] == "source_merged.ts"
+    assert meta["archive"]["validated"] is True
+    assert meta["archive"]["source_audio_passthrough"] is True
+    assert meta["archive"]["raw_segments_removed"] == 1
+    assert meta["archive"]["raw_cleanup_complete"] is True
 
 
 @REQUIRES_FFMPEG
@@ -369,9 +578,6 @@ def test_passthrough_non_frame_aligned_slices_preserve_contiguous_packets(
     ]
     monkeypatch.setattr(recorder, "_collect_lane", lambda *_args: runs)
 
-    recorder.finalize(session)
-
-    final = tmp_path / "final.m4a"
     expected_frames = int(
         session.end_offset
         * recorder._OUTPUT_SAMPLE_RATE
@@ -379,10 +585,19 @@ def test_passthrough_non_frame_aligned_slices_preserve_contiguous_packets(
         + 0.5
     )
     expected_adts = tmp_path / "expected.aac"
-    actual_adts = tmp_path / "actual.aac"
     _remux_to_adts(source, expected_adts, frames=expected_frames)
+
+    recorder.finalize(session)
+
+    final = tmp_path / "final.m4a"
+    archive = tmp_path / "source_merged.ts"
+    actual_adts = tmp_path / "actual.aac"
+    archive_adts = tmp_path / "archive.aac"
     _remux_to_adts(final, actual_adts)
+    _remux_to_adts(archive, archive_adts)
     assert actual_adts.read_bytes() == expected_adts.read_bytes()
+    assert archive_adts.read_bytes() == expected_adts.read_bytes()
+    assert not source.exists()
 
 
 @REQUIRES_FFMPEG
@@ -407,6 +622,8 @@ def test_primary_to_backup_switch_preserves_contiguous_packets(
         session_dir=tmp_path,
         workers=workers,
         end_offset=1.0,
+        stop_reason="live ended",
+        live_offline_offset=None,
         start_mono=time.monotonic() - 99.0,
         start_wall=123.0,
         room_id=456,
@@ -429,9 +646,6 @@ def test_primary_to_backup_switch_preserves_contiguous_packets(
 
     monkeypatch.setattr(recorder, "_collect_lane", collect_lane)
 
-    recorder.finalize(session)
-
-    final = tmp_path / "final.m4a"
     expected_frames = int(
         session.end_offset
         * recorder._OUTPUT_SAMPLE_RATE
@@ -439,10 +653,20 @@ def test_primary_to_backup_switch_preserves_contiguous_packets(
         + 0.5
     )
     expected_adts = tmp_path / "expected-switch.aac"
-    actual_adts = tmp_path / "actual-switch.aac"
     _remux_to_adts(primary_source, expected_adts, frames=expected_frames)
+
+    recorder.finalize(session)
+
+    final = tmp_path / "final.m4a"
+    archive = tmp_path / "source_merged.ts"
+    actual_adts = tmp_path / "actual-switch.aac"
+    archive_adts = tmp_path / "archive-switch.aac"
     _remux_to_adts(final, actual_adts)
+    _remux_to_adts(archive, archive_adts)
     assert actual_adts.read_bytes() == expected_adts.read_bytes()
+    assert archive_adts.read_bytes() == expected_adts.read_bytes()
+    assert not primary_source.exists()
+    assert not backup_source.exists()
     meta = json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))
     assert meta["source_breakdown"] == {
         "primary_A": 0.5,
@@ -474,7 +698,10 @@ def test_finalize_fallback_normalizes_incompatible_source(
     recorder.finalize(session)
 
     final = tmp_path / "final.m4a"
+    archive = tmp_path / "source_merged.ts"
     assert final.exists()
+    assert not archive.exists()
+    assert source.exists()
     assert not (tmp_path / "final.partial.m4a").exists()
     assert not (tmp_path / "_parts").exists()
     _assert_fully_decodable(final)
@@ -517,6 +744,8 @@ def test_finalize_fallback_normalizes_incompatible_source(
     assert meta["processing_mode"] == "transcoded"
     assert meta["source_audio_passthrough"] is False
     assert meta["fallback_reason"] == "source audio is not AAC-LC 48 kHz stereo"
+    assert meta["archive"]["output"] == "(skipped)"
+    assert meta["archive"]["raw_cleanup_reason"] == "transcoded_final"
 
 
 @REQUIRES_FFMPEG
@@ -534,7 +763,10 @@ def test_passthrough_runtime_failure_uses_fallback(
     recorder.finalize(session)
 
     final = tmp_path / "final.m4a"
+    archive = tmp_path / "source_merged.ts"
     assert final.exists()
+    assert not archive.exists()
+    assert source.exists()
     _assert_fully_decodable(final)
     stream, _container = _probe_audio(final)
     assert (stream["codec_name"], stream["profile"]) == ("aac", "LC")
@@ -543,6 +775,113 @@ def test_passthrough_runtime_failure_uses_fallback(
     assert meta["processing_mode"] == "transcoded"
     assert meta["source_audio_passthrough"] is False
     assert meta["fallback_reason"] == "AAC part 0 failed frame validation"
+    assert meta["archive"]["output"] == "(skipped)"
+    assert meta["archive"]["raw_segments_removed"] == 0
+
+
+@REQUIRES_FFMPEG
+def test_finalize_trims_only_long_synthetic_live_end_tail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "audio_A_0001.ts"
+    _make_aac_ts(source)
+    session = _session(tmp_path, source)
+    session.end_offset = 122.0
+    session.live_offline_offset = 2.0
+    monkeypatch.setattr(
+        recorder, "_collect_lane", lambda *_args: _long_source_run(source)
+    )
+
+    recorder.finalize(session)
+
+    final = tmp_path / "final.m4a"
+    archive = tmp_path / "source_merged.ts"
+    expected_duration = 4.0
+    frame_tolerance = 3 * recorder._AAC_FRAME_SAMPLES / recorder._OUTPUT_SAMPLE_RATE
+    assert recorder._probe_decoded_duration(str(FFMPEG), final) == pytest.approx(
+        expected_duration, abs=frame_tolerance
+    )
+    assert recorder._probe_decoded_duration(str(FFMPEG), archive) == pytest.approx(
+        expected_duration, abs=frame_tolerance
+    )
+    assert not source.exists()
+
+    meta = json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["capture_duration"] == 122.0
+    assert meta["duration"] == 122.0
+    assert meta["timeline_end_offset"] == 4.0
+    assert meta["source_breakdown"] == {
+        "primary_A": 2.0,
+        "backup_B": 0.0,
+        "silence": 2.0,
+    }
+    assert meta["gaps"] == [
+        {
+            "at": 2.0,
+            "dur": 2.0,
+            "trailing": True,
+            "original_dur": 120.0,
+            "trimmed": 118.0,
+        }
+    ]
+    assert meta["trailing_trim"]["applied"] is True
+    assert meta["trailing_trim"]["detected_seconds"] == 120.0
+    assert meta["trailing_trim"]["kept_seconds"] == 2.0
+    assert meta["trailing_trim"]["removed_seconds"] == 118.0
+
+
+@REQUIRES_FFMPEG
+def test_archive_failure_preserves_raw_segments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "audio_A_0001.ts"
+    _make_aac_ts(source)
+    original = source.read_bytes()
+    session = _session(tmp_path, source)
+    monkeypatch.setattr(
+        recorder, "_collect_lane", lambda *_args: _long_source_run(source)
+    )
+    monkeypatch.setattr(recorder, "_mux_m4a_to_ts", lambda *_args: False)
+
+    recorder.finalize(session)
+
+    assert (tmp_path / "final.m4a").exists()
+    assert not (tmp_path / "source_merged.ts").exists()
+    assert source.read_bytes() == original
+    meta = json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["output"] == "final.m4a"
+    assert meta["archive"]["output"] == "(failed)"
+    assert meta["archive"]["validated"] is False
+    assert meta["archive"]["raw_segments_removed"] == 0
+    assert meta["archive"]["raw_segments_remaining"] == 1
+    assert meta["archive"]["raw_cleanup_complete"] is False
+
+
+@REQUIRES_FFMPEG
+def test_unverified_source_segment_blocks_all_raw_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "audio_A_0001.ts"
+    unverified = tmp_path / "audio_C_9999.ts"
+    _make_aac_ts(source)
+    shutil.copyfile(source, unverified)
+    session = _session(tmp_path, source)
+    monkeypatch.setattr(
+        recorder, "_collect_lane", lambda *_args: _long_source_run(source)
+    )
+
+    recorder.finalize(session)
+
+    assert (tmp_path / "final.m4a").exists()
+    assert (tmp_path / "source_merged.ts").exists()
+    assert source.exists()
+    assert unverified.exists()
+    meta = json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["archive"]["validated"] is True
+    assert meta["archive"]["raw_segments_removed"] == 0
+    assert meta["archive"]["raw_segments_unverified"] == 1
+    assert meta["archive"]["raw_unverified_files"] == ["audio_C_9999.ts"]
+    assert meta["archive"]["raw_cleanup_reason"] == "unverified_segments"
 
 
 def test_finalize_failure_is_atomic_and_cleans_temporary_files(
@@ -573,6 +912,9 @@ def test_finalize_failure_is_atomic_and_cleans_temporary_files(
     recorder.finalize(session)
 
     assert existing.read_bytes() == b"existing-final"
+    assert source.read_bytes() == b"source"
+    assert not (tmp_path / "source_merged.ts").exists()
+    assert not (tmp_path / "source_merged.partial.ts").exists()
     assert not (tmp_path / "final.partial.m4a").exists()
     assert not (tmp_path / "_parts").exists()
     meta = json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))

@@ -69,6 +69,7 @@ def _run_self_test() -> int:
         "ffmpeg": False,
         "ffprobe": False,
         "aac_m4a": False,
+        "merged_ts": False,
         "browser": False,
         "errors": [],
     }
@@ -95,6 +96,7 @@ def _run_self_test() -> int:
             with tempfile.TemporaryDirectory(prefix="maoer-self-test-") as temp_dir:
                 adts_path = os.path.join(temp_dir, "sample.aac")
                 sample_path = os.path.join(temp_dir, "sample.m4a")
+                archive_path = os.path.join(temp_dir, "source_merged.ts")
                 encode = _run_hidden(
                     [
                         ffmpeg,
@@ -103,8 +105,7 @@ def _run_self_test() -> int:
                         "-nostdin",
                         "-y",
                         "-f", "lavfi",
-                        "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-                        "-t", "0.05",
+                        "-i", "sine=frequency=440:sample_rate=48000:duration=1",
                         "-map", "0:a:0",
                         "-c:a", "aac",
                         "-profile:a", "aac_low",
@@ -192,8 +193,59 @@ def _run_self_test() -> int:
                         f"unexpected audio stream {actual!r}, expected {expected!r}"
                     )
                 report["aac_m4a"] = True
+
+                archive = _run_hidden(
+                    [
+                        ffmpeg,
+                        "-hide_banner",
+                        "-loglevel", "error",
+                        "-nostdin",
+                        "-y",
+                        "-i", sample_path,
+                        "-map", "0:a:0",
+                        "-c:a", "copy",
+                        "-mpegts_flags", "+resend_headers",
+                        "-f", "mpegts",
+                        archive_path,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=15,
+                    check=False,
+                )
+                if archive.returncode != 0:
+                    detail = (
+                        (archive.stderr or b"").decode("utf-8", "replace").strip()[-400:]
+                    )
+                    raise RuntimeError(
+                        f"merged TS mux exited with {archive.returncode}: {detail}"
+                    )
+                decode = _run_hidden(
+                    [
+                        ffmpeg,
+                        "-v", "error",
+                        "-xerror",
+                        "-i", archive_path,
+                        "-map", "0:a:0",
+                        "-f", "null", "-",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=15,
+                    check=False,
+                )
+                if decode.returncode != 0:
+                    detail = (
+                        (decode.stderr or b"").decode("utf-8", "replace").strip()[-400:]
+                    )
+                    raise RuntimeError(
+                        f"merged TS decode exited with {decode.returncode}: {detail}"
+                    )
+                report["merged_ts"] = True
         except Exception as exc:
-            report["errors"].append(f"aac_m4a: {exc}")
+            report["errors"].append(f"media_pipeline: {exc}")
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
@@ -207,7 +259,8 @@ def _run_self_test() -> int:
     report_path = resolve_state_dir(resolve_recordings_dir()) / "self-test.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0 if all(
-        report[key] for key in ("ffmpeg", "ffprobe", "aac_m4a", "browser")
+        report[key]
+        for key in ("ffmpeg", "ffprobe", "aac_m4a", "merged_ts", "browser")
     ) else 1
 
 

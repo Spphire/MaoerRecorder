@@ -251,9 +251,11 @@ class Orchestrator:
             if not live:
                 if media_gone_since is None:
                     media_gone_since = now
+                    session.mark_live_offline()
                 draining = (now - media_gone_since) > self.cfg.media_drain_seconds
             else:
                 media_gone_since = None
+                session.mark_live_online()
                 draining = False
                 # Mid-stream: refresh recording identities so each lane has a
                 # fresh signed URL ready for its next ffmpeg restart.
