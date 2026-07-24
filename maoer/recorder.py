@@ -1455,7 +1455,10 @@ def finalize(session: RecordSession) -> None:
                 else:
                     fallback_reason = "M4A passthrough mux failed"
 
-    if not ok:
+    allow_transcode_fallback = bool(
+        getattr(session.cfg, "allow_transcode_fallback", True)
+    )
+    if not ok and allow_transcode_fallback:
         processing_mode = "transcoded"
         log.warning("AAC passthrough unavailable; using one-pass fallback: %s",
                     fallback_reason or "unknown reason")
@@ -1471,6 +1474,11 @@ def finalize(session: RecordSession) -> None:
             if validated:
                 media_info, final_dur = validated
                 ok = True
+    elif not ok:
+        log.warning(
+            "AAC passthrough unavailable and transcode fallback is disabled: %s",
+            fallback_reason or "unknown reason",
+        )
 
     archive_eligible = bool(ok and processing_mode == "passthrough")
     if archive_eligible and archive_requested:

@@ -212,6 +212,23 @@ def test_finalize_storage_config_defaults_and_overrides(
     assert overridden.delete_raw_segments_after_archive is False
 
 
+@REQUIRES_FFMPEG
+def test_finalize_can_disable_transcode_fallback(tmp_path: Path) -> None:
+    source = tmp_path / "audio_A_0001.ts"
+    _make_aac_ts(source, sample_rate=44100, duration=1.0)
+    session = _session(tmp_path, source)
+    session.cfg.allow_transcode_fallback = False
+
+    recorder.finalize(session)
+
+    assert source.exists()
+    assert not (tmp_path / "final.m4a").exists()
+    assert not (tmp_path / "source_merged.ts").exists()
+    meta = json.loads((tmp_path / "meta.json").read_text(encoding="utf-8"))
+    assert meta["output"] == "(failed)"
+    assert meta["archive"]["raw_cleanup_complete"] is False
+
+
 def test_capture_worker_uses_audio_stream_copy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
